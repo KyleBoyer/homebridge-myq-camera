@@ -1,0 +1,71 @@
+{
+  "pluginAlias": "MyqCamera",
+  "pluginType": "platform",
+  "singular": true,
+  "headerDisplay": "Native TypeScript support for legacy **TC-series** (Tend/Seedonk) myQ garage cameras. Streams video, camera audio, and HomeKit push-to-talk without a phone or Python runtime. Newer WebRTC/KVS myQ cameras are not supported.",
+  "footerDisplay": "Use a Homebridge child bridge for camera isolation. Run `homebridge-myq-camera-doctor --live 30` from the Homebridge terminal to validate credentials, FFmpeg, signaling, and media.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Platform Name",
+        "type": "string",
+        "default": "myQ Camera",
+        "required": true
+      },
+      "tokenFile": {
+        "title": "OAuth token file",
+        "type": "string",
+        "default": "~/.config/myqcam/token.json",
+        "description": "Refresh-token JSON from the one-time bootstrap. It is rotated atomically by the plugin."
+      },
+      "ffmpeg": {
+        "title": "Custom FFmpeg path",
+        "type": "string",
+        "description": "Leave blank to use Homebridge's bundled FFmpeg. A custom build needs libx264, libopus, and libfdk_aac for talkback."
+      },
+      "audio": {
+        "title": "Camera audio",
+        "type": "boolean",
+        "default": true
+      },
+      "talkback": {
+        "title": "HomeKit push-to-talk",
+        "type": "boolean",
+        "default": true,
+        "description": "Routes HomeKit return audio into the same native camera session."
+      },
+      "copyVideo": {
+        "title": "Copy native H.264",
+        "type": "boolean",
+        "default": false,
+        "description": "Avoids video transcoding but advertises only native 1280×720 at 20 fps. Leave off for maximum HomeKit compatibility."
+      },
+      "debug": {
+        "title": "Debug logging",
+        "type": "boolean",
+        "default": false
+      },
+      "cameras": {
+        "title": "Cameras",
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "title": "HomeKit name",
+              "type": "string",
+              "required": true
+            },
+            "deviceId": {
+              "title": "Camera device ID or myQ alias",
+              "type": "string",
+              "description": "Leave blank to use the first TC-series camera on the account."
+            }
+          }
+        }
+      }
+    }
+  }
+}

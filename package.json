@@ -1,0 +1,57 @@
+{
+  "displayName": "Homebridge myQ Camera (TC)",
+  "name": "homebridge-myq-camera",
+  "version": "0.2.2",
+  "description": "Native HomeKit camera plugin for legacy TC-series (Tend/Seedonk) myQ garage cameras.",
+  "author": "Kyle Boyer",
+  "license": "MIT",
+  "homepage": "https://github.com/KyleBoyer/homebridge-myq-camera#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KyleBoyer/homebridge-myq-camera.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KyleBoyer/homebridge-myq-camera/issues"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "homebridge-myq-camera-doctor": "dist/doctor.js"
+  },
+  "engines": {
+    "homebridge": "^1.8.0 || ^2.0.0",
+    "node": "^22.12.0 || ^24.0.0"
+  },
+  "keywords": [
+    "homebridge-plugin",
+    "myq",
+    "tend",
+    "seedonk",
+    "camera",
+    "homekit"
+  ],
+  "files": [
+    "dist/**/*",
+    "config.schema.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "npm run clean && tsc",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "prepare": "npm run build",
+    "prepack": "npm test"
+  },
+  "dependencies": {
+    "ffmpeg-for-homebridge": "^2.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "homebridge": "^2.1.0",
+    "typescript": "^5.9.0"
+  }
+}

@@ -1,0 +1,15 @@
+dist/
+node_modules/
+*.tgz
+.DS_Store
+
+logs/
+*.log
+
+coverage/
+.nyc_output/
+
+.env
+.env.*
+token.json
+*.pcap
