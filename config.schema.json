@@ -14,10 +14,10 @@
         "required": true
       },
       "tokenFile": {
-        "title": "OAuth token file",
+        "title": "OAuth token file override",
         "type": "string",
-        "default": "~/.config/myqcam/token.json",
-        "description": "Refresh-token JSON from the one-time bootstrap. It is rotated atomically by the plugin."
+        "default": "",
+        "description": "Optional. Leave blank to use Homebridge storage: <storage>/myq-camera/token.json. The plugin rotates this token file atomically."
       },
       "ffmpeg": {
         "title": "Custom FFmpeg path",

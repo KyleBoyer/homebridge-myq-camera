@@ -1,7 +1,7 @@
 {
   "displayName": "Homebridge myQ Camera (TC)",
   "name": "homebridge-myq-camera",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Native HomeKit camera plugin for legacy TC-series (Tend/Seedonk) myQ garage cameras.",
   "author": "Kyle Boyer",
   "license": "MIT",
@@ -32,6 +32,7 @@
   ],
   "files": [
     "dist/**/*",
+    "!dist/test/**/*",
     "config.schema.json",
     "README.md",
     "LICENSE"
@@ -43,8 +44,7 @@
     "clean": "rm -rf dist",
     "build": "npm run clean && tsc",
     "test": "npm run build && node --test dist/test/*.test.js",
-    "prepare": "npm run build",
-    "prepack": "npm test"
+    "prepack": "npm test && rm -rf dist/test"
   },
   "dependencies": {
     "ffmpeg-for-homebridge": "^2.2.2"

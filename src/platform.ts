@@ -1,5 +1,7 @@
 import { existsSync } from 'node:fs';
+import { chmod, copyFile, mkdir } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
 import type {
   API,
   DynamicPlatformPlugin,
@@ -23,16 +25,23 @@ export class MyqCameraPlatform implements DynamicPlatformPlugin {
   private readonly tokens: TokenManager;
   private readonly connection: TendConnectionManager;
   private readonly ffmpeg: string;
+  private readonly tokenFile: string;
+  private readonly legacyDefaultTokenFile?: string;
 
   constructor(
     private readonly log: Logger,
     private readonly config: MyqPlatformConfig,
     private readonly api: API,
   ) {
-    const tokenFile = config.tokenFile ?? '~/.config/myqcam/token.json';
-    this.tokens = new TokenManager(tokenFile);
+    const configuredTokenFile = config?.tokenFile?.trim();
+    this.tokenFile = configuredTokenFile
+      || join(api.user.storagePath(), 'myq-camera', 'token.json');
+    this.legacyDefaultTokenFile = configuredTokenFile
+      ? undefined
+      : expandHome('~/.config/myqcam/token.json');
+    this.tokens = new TokenManager(this.tokenFile);
     this.connection = new TendConnectionManager(this.tokens, log);
-    this.ffmpeg = config.ffmpeg?.trim() || bundledFfmpeg || 'ffmpeg';
+    this.ffmpeg = config?.ffmpeg?.trim() || bundledFfmpeg || 'ffmpeg';
     if (!config) {
       this.log.warn('Ignoring homebridge-myq-camera because it is not configured');
       return;
@@ -49,7 +58,17 @@ export class MyqCameraPlatform implements DynamicPlatformPlugin {
   }
 
   private async validateRuntime(): Promise<void> {
-    const tokenPath = expandHome(this.config.tokenFile ?? '~/.config/myqcam/token.json');
+    const tokenPath = expandHome(this.tokenFile);
+    if (!existsSync(tokenPath) && this.legacyDefaultTokenFile
+      && existsSync(this.legacyDefaultTokenFile)) {
+      await mkdir(dirname(tokenPath), { recursive: true, mode: 0o700 });
+      await copyFile(this.legacyDefaultTokenFile, tokenPath);
+      await chmod(tokenPath, 0o600);
+      this.log.warn(
+        `Migrated legacy myQ token file to Homebridge storage: ${tokenPath}. `
+        + 'You can remove the old ~/.config/myqcam/token.json file after confirming startup.',
+      );
+    }
     if (!existsSync(tokenPath)) {
       throw new Error(`OAuth token file not found: ${tokenPath}`);
     }

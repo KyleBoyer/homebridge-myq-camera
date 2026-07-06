@@ -22,7 +22,8 @@ WebRTC/Amazon-KVS cameras use an unrelated protocol.
 
 - Homebridge 1.8+ or 2.x on Node 22 or 24.
 - The Homebridge host must be on the same LAN as the camera.
-- A one-time myQ OAuth token file. The plugin rotates the refresh token atomically.
+- A one-time myQ OAuth token file. The plugin stores and rotates it atomically
+  under the Homebridge storage directory by default.
 
 The default Homebridge FFmpeg dependency includes libx264, libopus, and libfdk_aac.
 Do not configure a custom FFmpeg path unless you need one.
@@ -45,18 +46,27 @@ Once published:
 npm install -g homebridge-myq-camera
 ```
 
-Place the token where the Homebridge service account can read and update it:
+Place the token where the Homebridge service account can read and update it. By
+default the plugin uses:
 
-```bash
-mkdir -p ~/.config/myqcam
-cp token.json ~/.config/myqcam/token.json
-chmod 700 ~/.config/myqcam
-chmod 600 ~/.config/myqcam/token.json
+```text
+<Homebridge storage>/myq-camera/token.json
 ```
 
-For a service installation, `~` means the Homebridge service user's home (commonly
-`/var/lib/homebridge`). The token file must be writable because myQ rotates refresh
-tokens.
+For Homebridge OS / service installs this is commonly
+`/var/lib/homebridge/myq-camera/token.json`. For a local development Homebridge
+started without `-U`, it is usually `~/.homebridge/myq-camera/token.json`.
+
+```bash
+sudo mkdir -p /var/lib/homebridge/myq-camera
+sudo cp token.json /var/lib/homebridge/myq-camera/token.json
+sudo chown -R homebridge:homebridge /var/lib/homebridge/myq-camera
+sudo chmod 700 /var/lib/homebridge/myq-camera
+sudo chmod 600 /var/lib/homebridge/myq-camera/token.json
+```
+
+If your Homebridge uses a different storage path, copy the token there instead,
+or set `tokenFile` explicitly in the plugin config.
 
 ## Validate before pairing
 
@@ -65,6 +75,12 @@ Run from the Homebridge terminal:
 ```bash
 homebridge-myq-camera-doctor
 homebridge-myq-camera-doctor --live 30
+```
+
+If your storage path is not the default `~/.homebridge`, pass it explicitly:
+
+```bash
+homebridge-myq-camera-doctor --storage-path /var/lib/homebridge --live 30
 ```
 
 The live check must report both H.264 and μ-law frames. An optional audible talkback
@@ -80,7 +96,7 @@ homebridge-myq-camera-doctor --live 10 --talk /path/to/speech.wav
 {
   "platform": "MyqCamera",
   "name": "myQ Camera",
-  "tokenFile": "~/.config/myqcam/token.json",
+  "tokenFile": "",
   "audio": true,
   "talkback": true,
   "copyVideo": false,

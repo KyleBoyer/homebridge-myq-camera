@@ -2,6 +2,8 @@
 
 import { existsSync } from 'node:fs';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import bundledFfmpeg from 'ffmpeg-for-homebridge';
 import { expandHome, TokenManager } from './auth';
 import { MyqCameraSession, TendConnectionManager } from './session';
@@ -12,8 +14,15 @@ function argument(name: string, fallback?: string): string | undefined {
   return index >= 0 ? process.argv[index + 1] : fallback;
 }
 
+function defaultStoragePath(): string {
+  return process.env.HOMEBRIDGE_USER_STORAGE_PATH
+    || process.env.HOMEBRIDGE_STORAGE_PATH
+    || join(homedir(), '.homebridge');
+}
+
 async function main(): Promise<void> {
-  const tokenFile = argument('--token-file', '~/.config/myqcam/token.json')!;
+  const storagePath = expandHome(argument('--storage-path', defaultStoragePath())!);
+  const tokenFile = argument('--token-file', join(storagePath, 'myq-camera', 'token.json'))!;
   const camera = argument('--camera');
   const liveSeconds = Number(argument('--live', '0'));
   const talkFile = argument('--talk');
