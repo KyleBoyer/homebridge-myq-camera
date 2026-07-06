@@ -40,6 +40,10 @@ interface ActiveSession {
   cleanup: () => void;
 }
 
+type ErrorEmitter = {
+  on(event: 'error', listener: (error: NodeJS.ErrnoException) => void): unknown;
+};
+
 function reservePort(ipv6: boolean): Promise<number> {
   return new Promise((resolve, reject) => {
     const socket = createSocket(ipv6 ? 'udp6' : 'udp4');
@@ -51,8 +55,36 @@ function reservePort(ipv6: boolean): Promise<number> {
   });
 }
 
-function write(stream: Writable | null, data: Buffer): void {
-  if (stream && !stream.destroyed) stream.write(data);
+function isExpectedTeardownError(error: NodeJS.ErrnoException): boolean {
+  return error.code === 'ECONNRESET'
+    || error.code === 'EPIPE'
+    || error.code === 'ERR_STREAM_DESTROYED'
+    || error.code === 'ERR_STREAM_PREMATURE_CLOSE'
+    || error.code === 'ERR_STREAM_WRITE_AFTER_END';
+}
+
+function pipeLabel(error: NodeJS.ErrnoException): string {
+  return error.code ? `${error.code}: ${error.message}` : error.message;
+}
+
+function observeErrors(
+  emitter: ErrorEmitter | null | undefined,
+  onError: (error: NodeJS.ErrnoException) => void,
+): void {
+  emitter?.on('error', onError);
+}
+
+function write(
+  stream: Writable | null,
+  data: Buffer,
+  onError?: (error: NodeJS.ErrnoException) => void,
+): void {
+  if (!stream || stream.destroyed || !stream.writable) return;
+  try {
+    stream.write(data);
+  } catch (error) {
+    onError?.(error as NodeJS.ErrnoException);
+  }
 }
 
 // MPEG-4 AudioSpecificConfig values for AAC-ELD, mono, 480-sample short frames.
@@ -178,9 +210,20 @@ export class StreamingDelegate implements CameraStreamingDelegate {
       const timeout = setTimeout(() => finish(new Error('snapshot timeout')), 15_000);
       ffmpeg.stdout.on('data', (data: Buffer) => chunks.push(data));
       ffmpeg.stderr.on('data', (data: Buffer) => this.debugFfmpeg('snapshot', data));
+      observeErrors(ffmpeg.stdin, (error) => {
+        if (!completed && !isExpectedTeardownError(error)) finish(error);
+      });
+      observeErrors(ffmpeg.stdout, (error) => {
+        if (!completed && !isExpectedTeardownError(error)) finish(error);
+      });
+      observeErrors(ffmpeg.stderr, (error) => {
+        if (!completed && !isExpectedTeardownError(error)) finish(error);
+      });
       ffmpeg.once('error', finish);
       ffmpeg.once('close', () => finish());
-      camera.on('video', (frame: Buffer) => write(ffmpeg.stdin, frame));
+      camera.on('video', (frame: Buffer) => write(ffmpeg.stdin, frame, (error) => {
+        if (!completed && !isExpectedTeardownError(error)) finish(error);
+      }));
       camera.once('error', (error: Error) => finish(error));
       try {
         await camera.open();
@@ -323,6 +366,28 @@ export class StreamingDelegate implements CameraStreamingDelegate {
       '-af', 'highpass=f=120,lowpass=f=3400,alimiter=limit=0.95',
       '-f', 'mulaw', 'pipe:1',
     ]);
+    child.once('error', (error: NodeJS.ErrnoException) => {
+      if (isExpectedTeardownError(error)) {
+        this.log.debug?.(`[${this.cameraConfig.name}] HomeKit talkback receiver closed: ${pipeLabel(error)}`);
+      } else {
+        this.log.warn(`HomeKit talkback receiver failed: ${pipeLabel(error)}`);
+      }
+    });
+    observeErrors(child.stdin, (error) => {
+      if (!isExpectedTeardownError(error)) {
+        this.log.warn(`HomeKit talkback SDP pipe failed: ${pipeLabel(error)}`);
+      }
+    });
+    observeErrors(child.stdout, (error) => {
+      if (!isExpectedTeardownError(error)) {
+        this.log.warn(`HomeKit talkback audio pipe failed: ${pipeLabel(error)}`);
+      }
+    });
+    observeErrors(child.stderr, (error) => {
+      if (!isExpectedTeardownError(error)) {
+        this.log.warn(`HomeKit talkback log pipe failed: ${pipeLabel(error)}`);
+      }
+    });
     child.stdout.on('data', (data: Buffer) => {
       if (!loggedDecodedAudio) {
         loggedDecodedAudio = true;
@@ -339,7 +404,14 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         );
       }
     });
-    child.stdin.end(this.returnAudioSdp(request, info));
+    try {
+      child.stdin.end(this.returnAudioSdp(request, info));
+    } catch (error) {
+      const pipeError = error as NodeJS.ErrnoException;
+      if (!isExpectedTeardownError(pipeError)) {
+        this.log.warn(`HomeKit talkback SDP write failed: ${pipeLabel(pipeError)}`);
+      }
+    }
     return child;
   }
 
@@ -381,15 +453,39 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         active.ffmpeg = ffmpeg;
         const videoInput = ffmpeg.stdio[3] as Writable;
         const audioInput = ffmpeg.stdio[4] as Writable;
-        camera.on('video', (frame: Buffer) => write(videoInput, frame));
-        camera.on('audio', (frame: Buffer) => write(audioInput, frame));
+        const handlePipeError = (scope: string, error: NodeJS.ErrnoException): void => {
+          if (isExpectedTeardownError(error)) {
+            if (this.config.debug) {
+              this.log.debug(`[${this.cameraConfig.name}] ${scope} closed during stream teardown: ${pipeLabel(error)}`);
+            }
+            return;
+          }
+          this.log.warn(`[${this.cameraConfig.name}] ${scope} pipe failed: ${pipeLabel(error)}`);
+          active.cleanup();
+        };
+        observeErrors(videoInput, (error) => handlePipeError('ffmpeg video input', error));
+        observeErrors(audioInput, (error) => handlePipeError('ffmpeg audio input', error));
+        observeErrors(ffmpeg.stderr, (error) => handlePipeError('ffmpeg log output', error));
+        camera.on('video', (frame: Buffer) => write(
+          videoInput,
+          frame,
+          (error) => handlePipeError('ffmpeg video input', error),
+        ));
+        camera.on('audio', (frame: Buffer) => write(
+          audioInput,
+          frame,
+          (error) => handlePipeError('ffmpeg audio input', error),
+        ));
         camera.on('error', (error: Error) => {
           this.log.error(`myQ media error: ${error.message}`);
           active.cleanup();
         });
         ffmpeg.stderr?.on('data', (data: Buffer) => this.debugFfmpeg('stream', data));
-        ffmpeg.once('error', (error) => {
+        ffmpeg.once('error', (error: NodeJS.ErrnoException) => {
           if (!started) callback(error);
+          else if (!isExpectedTeardownError(error)) {
+            this.log.warn(`[${this.cameraConfig.name}] ffmpeg stream process failed: ${pipeLabel(error)}`);
+          }
           active.cleanup();
         });
         ffmpeg.once('close', () => active.cleanup());
@@ -417,9 +513,6 @@ export class StreamingDelegate implements CameraStreamingDelegate {
             + `ptime=${request.audio.packet_time}ms, pt=${request.audio.pt})`,
           );
           active.returnFfmpeg = this.startReturnAudio(request, camera, info);
-          active.returnFfmpeg.once('error', (error) => {
-            this.log.warn(`HomeKit talkback receiver failed: ${error.message}`);
-          });
         }
         started = true;
         callback();
