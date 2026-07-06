@@ -6,12 +6,14 @@
   "footerDisplay": "Use a Homebridge child bridge for camera isolation. Run `homebridge-myq-camera-doctor --live 30` from the Homebridge terminal to validate credentials, FFmpeg, signaling, and media.",
   "schema": {
     "type": "object",
+    "required": [
+      "name"
+    ],
     "properties": {
       "name": {
         "title": "Platform Name",
         "type": "string",
-        "default": "myQ Camera",
-        "required": true
+        "default": "myQ Camera"
       },
       "tokenFile": {
         "title": "OAuth token file override",
@@ -52,11 +54,13 @@
         "minItems": 1,
         "items": {
           "type": "object",
+          "required": [
+            "name"
+          ],
           "properties": {
             "name": {
               "title": "HomeKit name",
-              "type": "string",
-              "required": true
+              "type": "string"
             },
             "deviceId": {
               "title": "Camera device ID or myQ alias",
