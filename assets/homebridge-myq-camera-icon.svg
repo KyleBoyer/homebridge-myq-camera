@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">homebridge-myq-camera icon</title>
+  <desc id="desc">A generic garage camera icon shaped like the letter Q.</desc>
+  <rect width="512" height="512" fill="#491f59"/>
+  <circle cx="256" cy="262" r="142" fill="#ffffff"/>
+  <path
+    d="M323 316 438 431c11.7 11.7 11.7 30.7 0 42.4s-30.7 11.7-42.4 0L280 358Z"
+    fill="#ffffff"/>
+  <circle cx="256" cy="262" r="86" fill="#491f59"/>
+  <circle cx="256" cy="262" r="48" fill="#2f123f"/>
+  <circle cx="238" cy="244" r="15" fill="#ffffff" opacity=".45"/>
+  <rect x="166" y="92" width="180" height="64" rx="28" fill="#ffffff" opacity=".92"/>
+</svg>
