@@ -30,21 +30,42 @@ Do not configure a custom FFmpeg path unless you need one.
 
 ## Install
 
-During local development:
+Install through the Homebridge UI (search for **myQ Camera**), or from the command line:
+
+```bash
+npm install -g homebridge-myq-camera
+```
+
+For local development from a checkout:
 
 ```bash
 cd homebridge-myq-camera
 npm install
 npm test
 npm pack
-npm install -g ./homebridge-myq-camera-0.2.2.tgz
+npm install -g ./homebridge-myq-camera-*.tgz
 ```
 
-Once published:
+## Getting your myQ token
 
-```bash
-npm install -g homebridge-myq-camera
+The plugin authenticates with a one-time myQ OAuth **refresh token**, then rotates it
+itself forever with no phone involved. myQ enforces Firebase App Check / Play Integrity
+only on the *initial* login, not on the refresh grant — which is why day-to-day operation
+is device-free, but obtaining that first token requires one interaction with a
+genuine, signed-in myQ app.
+
+Create `<Homebridge storage>/myq-camera/token.json` (mode `0600`) containing at least a
+valid refresh token:
+
+```json
+{"access_token": "", "refresh_token": "PASTE_YOUR_REFRESH_TOKEN"}
 ```
+
+`access_token` may be left empty — the plugin exchanges the refresh token on first use and
+stores the rotated result. To obtain the refresh token, extract it once from a logged-in
+myQ app session on a rooted Android device — e.g. hook `javax.crypto.Cipher.doFinal` with
+Frida and capture the 64-hex refresh token the app decrypts at launch. Guard this file —
+it is a live account credential.
 
 Place the token where the Homebridge service account can read and update it. By
 default the plugin uses:
@@ -132,6 +153,10 @@ serialized; while live video is active HomeKit receives the last cached snapshot
 Push-to-talk return audio is decrypted from HomeKit SRTP by FFmpeg, converted once to
 8 kHz μ-law, and injected into the existing Seedonk audio channel. Camera audio travels
 the opposite direction without an intermediate lossy AAC hop.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Scope
 

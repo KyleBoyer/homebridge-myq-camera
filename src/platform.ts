@@ -104,6 +104,14 @@ export class MyqCameraPlatform implements DynamicPlatformPlugin {
       this.log.error(`myQ Camera startup check failed: ${String(error)}`);
       return;
     }
+    try {
+      this.publishCameras();
+    } catch (error) {
+      this.log.error(`myQ Camera setup failed: ${String(error)}`);
+    }
+  }
+
+  private publishCameras(): void {
     const cameras: CameraConfig[] = this.config.cameras?.length
       ? this.config.cameras
       : [{ name: this.config.name || 'myQ Camera' }];
