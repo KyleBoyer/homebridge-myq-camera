@@ -490,6 +490,14 @@ export class TendClient {
     );
   }
 
+  stopVideo(camera: Camera, info: ConnectionInfo): void {
+    this.cxs.sendCommand(
+      `stop-video-receive|${camera.deviceId}|9|`,
+      camera.cxsDestination,
+      info.correlation,
+    );
+  }
+
   async getAudioConnection(camera: Camera): Promise<ConnectionInfo> {
     const sessionToken = `${camera.deviceId}:${Date.now()}`;
     const correlation = this.cxs.sendCommand(
@@ -508,6 +516,15 @@ export class TendClient {
   startAudio(camera: Camera, info: ConnectionInfo): void {
     this.cxs.sendCommand(
       `start-audio-receive|${camera.deviceId}|${info.sessionToken}|9|`,
+      camera.cxsDestination,
+      info.correlation,
+    );
+  }
+
+  stopAudio(camera: Camera, info: ConnectionInfo): void {
+    if (!info.sessionToken) throw new Error('audio connection is missing session token');
+    this.cxs.sendCommand(
+      `stop-audio-receive|${camera.deviceId}|${info.sessionToken}|9|`,
       camera.cxsDestination,
       info.correlation,
     );

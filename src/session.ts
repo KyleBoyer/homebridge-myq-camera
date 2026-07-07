@@ -3,7 +3,7 @@ import { TokenManager } from './auth';
 import { TendClient } from './cxs';
 import { KeyframeGate } from './h264';
 import { P2PMediaSession } from './p2p';
-import type { Camera, PluginLogger } from './types';
+import type { Camera, ConnectionInfo, PluginLogger } from './types';
 
 export interface CameraSessionOptions {
   camera?: string;
@@ -74,7 +74,9 @@ export class TendConnectionManager {
 export class MyqCameraSession extends EventEmitter {
   private client?: TendClient;
   private video?: P2PMediaSession;
+  private videoInfo?: ConnectionInfo;
   private audio?: P2PMediaSession;
+  private audioInfo?: ConnectionInfo;
   private closed = false;
   camera?: Camera;
 
@@ -122,6 +124,7 @@ export class MyqCameraSession extends EventEmitter {
     this.video.on('error', (error) => this.emit('error', error));
     await this.video.punch();
     this.client.startVideo(this.camera, videoInfo);
+    this.videoInfo = videoInfo;
     this.client.setVideoQuality(
       this.camera,
       this.options.quality ?? 3,
@@ -139,10 +142,12 @@ export class MyqCameraSession extends EventEmitter {
         this.audio.on('error', (error) => this.emit('error', error));
         await this.audio.punch();
         this.client.startAudio(this.camera, audioInfo);
+        this.audioInfo = audioInfo;
       } catch (error) {
         this.log.warn(`myQ audio unavailable; continuing video-only: ${String(error)}`);
         this.audio?.close();
         this.audio = undefined;
+        this.audioInfo = undefined;
       }
     }
 
@@ -158,13 +163,27 @@ export class MyqCameraSession extends EventEmitter {
     this.audio.enqueueTalkback(data);
   }
 
+  private stopSignaling(kind: 'video' | 'audio', info?: ConnectionInfo): void {
+    if (!this.client || !this.camera || !info) return;
+    try {
+      if (kind === 'video') this.client.stopVideo(this.camera, info);
+      else this.client.stopAudio(this.camera, info);
+    } catch (error) {
+      this.log.warn(`myQ ${kind} stop command failed; closing local sockets anyway: ${String(error)}`);
+    }
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.stopSignaling('video', this.videoInfo);
+    this.stopSignaling('audio', this.audioInfo);
     this.video?.close();
     this.audio?.close();
     this.video = undefined;
+    this.videoInfo = undefined;
     this.audio = undefined;
+    this.audioInfo = undefined;
     this.client = undefined;
   }
 }
