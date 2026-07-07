@@ -1,5 +1,8 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createSocket, type Socket } from 'node:dgram';
+import { readFileSync } from 'node:fs';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import type { Writable } from 'node:stream';
 import type {
   API,
@@ -119,6 +122,9 @@ export class StreamingDelegate implements CameraStreamingDelegate {
   private readonly active = new Map<string, ActiveSession>();
   private sessionLock: Promise<void> = Promise.resolve();
   private lastSnapshot?: Buffer;
+  private lastSnapshotAt = 0;
+  private readonly snapshotFile: string;
+  private snapshotRefreshing = false;
 
   private readonly wantAudio: boolean;
   private readonly wantTalkback: boolean;
@@ -136,6 +142,21 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     this.wantAudio = config.audio !== false;
     this.wantTalkback = this.wantAudio && config.talkback !== false;
     this.copyVideo = config.copyVideo === true;
+
+    // Persist snapshots to the Homebridge storage dir so a restart (or update)
+    // serves the last still without opening a fresh camera session — a TC
+    // camera serves one viewer at a time, and HomeKit fetches a snapshot right
+    // before it starts a stream, so a cold snapshot session would race the
+    // stream's hole punch.
+    const slug = (cameraConfig.deviceId || cameraConfig.name || 'camera')
+      .replace(/[^\w.-]+/g, '_');
+    this.snapshotFile = join(api.user.storagePath(), 'myq-camera', `snapshot-${slug}.jpg`);
+    try {
+      this.lastSnapshot = readFileSync(this.snapshotFile);
+      this.lastSnapshotAt = Date.now();
+    } catch {
+      // no persisted snapshot yet — the first request takes a live one
+    }
 
     const resolutions: Array<[number, number, number]> = this.copyVideo
       ? [[1280, 720, 20]]
@@ -184,12 +205,67 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     this.sessionLock = run.catch((error) => this.log.error(String(error)));
   }
 
+  private async persistSnapshot(image: Buffer): Promise<void> {
+    this.lastSnapshot = image;
+    this.lastSnapshotAt = Date.now();
+    try {
+      await mkdir(dirname(this.snapshotFile), { recursive: true });
+      await writeFile(this.snapshotFile, image);
+    } catch (error) {
+      this.log.debug(`[${this.cameraConfig.name}] could not persist snapshot: ${describeError(error)}`);
+    }
+  }
+
+  /**
+   * Refresh the cached still from an active stream so snapshots stay current
+   * without ever opening a competing session. Taps the video frames already
+   * flowing from the camera into a one-shot FFmpeg that emits a single JPEG.
+   */
+  private refreshSnapshotFromStream(camera: MyqCameraSession): void {
+    if (this.snapshotRefreshing) return;
+    // A cache younger than a couple of minutes is fresh enough.
+    if (this.lastSnapshot && Date.now() - this.lastSnapshotAt < 120_000) return;
+    this.snapshotRefreshing = true;
+    const ffmpeg = spawn(this.ffmpegPath, [
+      '-hide_banner', '-loglevel', 'error',
+      '-f', 'h264', '-i', 'pipe:0',
+      '-frames:v', '1', '-f', 'image2', 'pipe:1',
+    ]);
+    const chunks: Buffer[] = [];
+    const onVideo = (frame: Buffer): void => write(ffmpeg.stdin, frame, () => {});
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(guard);
+      camera.removeListener('video', onVideo);
+      this.snapshotRefreshing = false;
+      ffmpeg.kill('SIGKILL');
+      if (chunks.length) void this.persistSnapshot(Buffer.concat(chunks));
+    };
+    const guard = setTimeout(finish, 8_000);
+    ffmpeg.stdout.on('data', (data: Buffer) => chunks.push(data));
+    observeErrors(ffmpeg.stdin, () => {});
+    observeErrors(ffmpeg.stdout, () => {});
+    observeErrors(ffmpeg.stderr, () => {});
+    ffmpeg.once('error', finish);
+    ffmpeg.once('close', finish);
+    camera.on('video', onVideo);
+  }
+
   handleSnapshotRequest(request: SnapshotRequest, callback: SnapshotRequestCallback): void {
+    // Serve the cached still whenever we have one. Opening a dedicated snapshot
+    // session would take the camera's single viewer slot moments before HomeKit
+    // starts a stream, and the camera needs time to release it — the classic
+    // snapshot→stream hole-punch collision. The cache is refreshed from live
+    // streams and persisted across restarts, so this only opens a session on a
+    // genuinely cold cache (first ever use).
+    if (this.lastSnapshot) {
+      callback(undefined, this.lastSnapshot);
+      return;
+    }
     if (this.active.size > 0) {
-      callback(
-        this.lastSnapshot ? undefined : new Error('camera is busy streaming'),
-        this.lastSnapshot,
-      );
+      callback(new Error('camera is streaming; snapshot will be available shortly'));
       return;
     }
     this.withSession(async () => {
@@ -212,7 +288,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         camera.close();
         ffmpeg.kill('SIGKILL');
         const image = chunks.length ? Buffer.concat(chunks) : undefined;
-        if (image) this.lastSnapshot = image;
+        if (image) void this.persistSnapshot(image);
         callback(error ?? (image ? undefined : new Error('snapshot produced no image')), image);
       };
       const timeout = setTimeout(() => finish(new Error('snapshot timeout')), 15_000);
@@ -482,7 +558,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
           this.log.warn(`HomeKit stream failed for ${this.cameraConfig.name}: ${error.message}`);
           finishCallback(error);
           active.cleanup('startup-timeout');
-        }, 30_000);
+        }, 45_000);
         this.log.info(
           `Starting HomeKit stream for ${this.cameraConfig.name} `
           + `(${request.video.width}x${request.video.height}@${request.video.fps}fps)`,
@@ -582,6 +658,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         if (startupTimeout) clearTimeout(startupTimeout);
         finishCallback();
         this.log.info(`Started HomeKit stream for ${this.cameraConfig.name}`);
+        this.refreshSnapshotFromStream(camera);
       } catch (error) {
         this.log.warn(`HomeKit stream failed for ${this.cameraConfig.name}: ${describeError(error)}`);
         if (this.config.debug && error instanceof Error && error.stack) {

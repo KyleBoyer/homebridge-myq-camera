@@ -506,7 +506,30 @@ export class P2PMediaSession extends EventEmitter {
   close(): void {
     if (this.reportTimer) clearInterval(this.reportTimer);
     if (this.talkTimer) clearTimeout(this.talkTimer);
+    this.sendBye();
     this.channels.forEach((channel) => channel.socket.close());
     this.channels = [];
+  }
+
+  /**
+   * RTCP BYE (PT 203) on the control channel: tell the camera this receiver is
+   * leaving so it can free its single-viewer slot promptly instead of waiting
+   * out the receiver-report timeout. Best-effort — sent right before the
+   * sockets close, mirroring the app's native RTP teardown.
+   */
+  private sendBye(): void {
+    const channel = this.channels[1];
+    if (!channel?.peer) return;
+    const bye = Buffer.alloc(8);
+    bye[0] = 0x81; // version 2, source count 1
+    bye[1] = 203; // BYE
+    bye.writeUInt16BE(1, 2); // length in 32-bit words minus one
+    bye.writeUInt32BE(this.localSsrc, 4);
+    try {
+      send(channel, bye, channel.peer);
+      send(channel, bye, channel.peer);
+    } catch {
+      // best-effort; the socket is about to close regardless
+    }
   }
 }

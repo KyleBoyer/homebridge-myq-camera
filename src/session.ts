@@ -21,11 +21,30 @@ export class TendConnectionManager {
   private client?: TendClient;
   private pending?: Promise<TendClient>;
   private keepalive?: NodeJS.Timeout;
+  private lastReleaseAt = 0;
 
   constructor(
     private readonly tokens: TokenManager,
     private readonly log: PluginLogger,
   ) {}
+
+  /** Record when a media session let go of the camera's single-viewer slot. */
+  noteRelease(): void {
+    this.lastReleaseAt = Date.now();
+  }
+
+  /**
+   * A TC camera serves one live viewer and needs a moment to free that slot
+   * after a session closes. HomeKit fetches a snapshot immediately before it
+   * starts a stream, so without a gap the stream's hole punch races the
+   * just-closed snapshot session. Wait out a minimum cooldown since the last
+   * release before opening the next session.
+   */
+  async awaitReleaseCooldown(minGapMs = 3_000): Promise<void> {
+    if (!this.lastReleaseAt) return;
+    const remaining = minGapMs - (Date.now() - this.lastReleaseAt);
+    if (remaining > 0) await delay(remaining);
+  }
 
   async connect(): Promise<TendClient> {
     if (this.client) return this.client;
@@ -101,6 +120,54 @@ export class MyqCameraSession extends EventEmitter {
     throw last;
   }
 
+  /**
+   * Establish the video channel, retrying the hole punch through the brief
+   * window where the camera is still releasing a prior viewer session. Each
+   * attempt requests fresh connection info because the relay assignment may
+   * change between tries.
+   */
+  private async establishVideo(attempts = 2): Promise<void> {
+    const noop = (): void => {};
+    let last: unknown;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const info = await this.retry(() => this.client!.getVideoConnection(this.camera!), 2);
+      const session = new P2PMediaSession(this.camera!, info, 'V', 'w1', 90_000);
+      session.on('error', noop); // absorb transient socket errors during the punch
+      try {
+        await session.punch(8_000);
+      } catch (error) {
+        last = error;
+        session.close();
+        if (attempt + 1 < attempts) {
+          this.log.warn(
+            `myQ video hole punch failed (attempt ${attempt + 1}/${attempts}); the camera `
+            + 'may still be releasing a prior session — retrying after a cooldown',
+          );
+          await delay(4_000);
+          continue;
+        }
+        throw last;
+      }
+      session.removeListener('error', noop);
+      const gate = new KeyframeGate();
+      session.on('record', (record: Buffer) => {
+        gate.feed(record).forEach((frame) => this.emit('video', frame));
+      });
+      session.on('error', (error) => this.emit('error', error));
+      this.video = session;
+      this.videoInfo = info;
+      this.client!.startVideo(this.camera!, info);
+      this.client!.setVideoQuality(
+        this.camera!,
+        this.options.quality ?? 3,
+        this.options.fps ?? 20,
+        this.options.size ?? 0,
+      );
+      return;
+    }
+    throw last;
+  }
+
   async open(): Promise<void> {
     this.client = await this.connection.connect();
     const cameras = this.client.listCameras();
@@ -115,22 +182,8 @@ export class MyqCameraSession extends EventEmitter {
         : 'no Tend TC-series cameras found on this account');
     }
 
-    const videoInfo = await this.retry(() => this.client!.getVideoConnection(this.camera!));
-    this.video = new P2PMediaSession(this.camera, videoInfo, 'V', 'w1', 90_000);
-    const gate = new KeyframeGate();
-    this.video.on('record', (record: Buffer) => {
-      gate.feed(record).forEach((frame) => this.emit('video', frame));
-    });
-    this.video.on('error', (error) => this.emit('error', error));
-    await this.video.punch();
-    this.client.startVideo(this.camera, videoInfo);
-    this.videoInfo = videoInfo;
-    this.client.setVideoQuality(
-      this.camera,
-      this.options.quality ?? 3,
-      this.options.fps ?? 20,
-      this.options.size ?? 0,
-    );
+    await this.connection.awaitReleaseCooldown();
+    await this.establishVideo();
 
     if (this.options.audio !== false) {
       try {
@@ -185,5 +238,6 @@ export class MyqCameraSession extends EventEmitter {
     this.audio = undefined;
     this.audioInfo = undefined;
     this.client = undefined;
+    this.connection.noteRelease();
   }
 }
