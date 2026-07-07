@@ -37,7 +37,7 @@ interface ActiveSession {
   returnFfmpeg?: ChildProcess;
   returnSocket?: Socket;
   timeout?: NodeJS.Timeout;
-  cleanup: () => void;
+  cleanup: (reason?: string) => void;
 }
 
 type ErrorEmitter = {
@@ -456,8 +456,9 @@ export class StreamingDelegate implements CameraStreamingDelegate {
       };
       const active: ActiveSession = {
         camera,
-        cleanup: () => {
+        cleanup: (reason = 'unknown') => {
           if (cleaned) return;
+          const wasStarted = started;
           cleaned = true;
           if (startupTimeout) clearTimeout(startupTimeout);
           if (active.timeout) clearTimeout(active.timeout);
@@ -467,6 +468,9 @@ export class StreamingDelegate implements CameraStreamingDelegate {
           camera.close();
           this.active.delete(request.sessionID);
           this.pending.delete(request.sessionID);
+          if (wasStarted) {
+            this.log.info(`Stopped HomeKit stream for ${this.cameraConfig.name} (${reason})`);
+          }
           resolveLock();
         },
       };
@@ -477,7 +481,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
           const error = new Error('HomeKit stream startup timed out');
           this.log.warn(`HomeKit stream failed for ${this.cameraConfig.name}: ${error.message}`);
           finishCallback(error);
-          active.cleanup();
+          active.cleanup('startup-timeout');
         }, 30_000);
         this.log.info(
           `Starting HomeKit stream for ${this.cameraConfig.name} `
@@ -505,7 +509,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
             return;
           }
           this.log.warn(`[${this.cameraConfig.name}] ${scope} pipe failed: ${pipeLabel(error)}`);
-          active.cleanup();
+          active.cleanup('ffmpeg-pipe-error');
         };
         observeErrors(videoInput, (error) => handlePipeError('ffmpeg video input', error));
         observeErrors(audioInput, (error) => handlePipeError('ffmpeg audio input', error));
@@ -526,7 +530,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         }
         camera.on('error', (error: Error) => {
           this.log.error(`myQ media error: ${error.message}`);
-          active.cleanup();
+          active.cleanup('camera-error');
         });
         ffmpeg.stderr?.on('data', (data: Buffer) => this.debugFfmpeg('stream', data));
         ffmpeg.once('error', (error: NodeJS.ErrnoException) => {
@@ -537,7 +541,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
           else if (!isExpectedTeardownError(error)) {
             this.log.warn(`[${this.cameraConfig.name}] ffmpeg stream process failed: ${pipeLabel(error)}`);
           }
-          active.cleanup();
+          active.cleanup('ffmpeg-error');
         });
         ffmpeg.once('close', (code, signal) => {
           if (!started && !callbackCompleted) {
@@ -547,21 +551,21 @@ export class StreamingDelegate implements CameraStreamingDelegate {
             this.log.warn(`HomeKit stream failed for ${this.cameraConfig.name}: ${error.message}`);
             finishCallback(error);
           }
-          active.cleanup();
+          active.cleanup('ffmpeg-exit');
         });
 
         const returnSocket = createSocket(info.ipv6 ? 'udp6' : 'udp4');
         active.returnSocket = returnSocket;
         returnSocket.on('error', (error) => {
           this.log.error(`HomeKit RTCP socket failed: ${error.message}`);
-          active.cleanup();
+          active.cleanup('rtcp-error');
         });
         returnSocket.on('message', () => {
           if (active.timeout) clearTimeout(active.timeout);
           active.timeout = setTimeout(() => {
             this.log.info(`HomeKit client inactive; stopping ${this.cameraConfig.name}`);
             this.controller.forceStopStreamingSession(request.sessionID);
-            active.cleanup();
+            active.cleanup('homekit-inactive');
           }, Math.max(5, request.video.rtcp_interval * 5) * 1000);
         });
         returnSocket.bind(info.videoReturnPort);
@@ -584,7 +588,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
           this.log.debug(`[${this.cameraConfig.name}] stream startup stack: ${error.stack}`);
         }
         if (!started) finishCallback(error as Error);
-        active.cleanup();
+        active.cleanup(started ? 'stream-error' : 'startup-failure');
       }
       await holdLock;
     });
@@ -599,7 +603,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         callback();
         break;
       case this.hap.StreamRequestTypes.STOP:
-        this.active.get(request.sessionID)?.cleanup();
+        this.active.get(request.sessionID)?.cleanup('homekit-stop');
         callback();
         break;
       default:
@@ -613,7 +617,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
   }
 
   shutdown(): void {
-    this.active.forEach((session) => session.cleanup());
+    this.active.forEach((session) => session.cleanup('shutdown'));
     this.active.clear();
     this.pending.clear();
   }
