@@ -25,10 +25,10 @@ interface SessionInfo {
   videoReturnPort: number;
   videoSrtp: Buffer;
   videoSsrc: number;
-  audioPort: number;
-  audioReturnPort: number;
-  audioSrtp: Buffer;
-  audioSsrc: number;
+  audioPort?: number;
+  audioReturnPort?: number;
+  audioSrtp?: Buffer;
+  audioSsrc?: number;
 }
 
 interface ActiveSession {
@@ -65,6 +65,14 @@ function isExpectedTeardownError(error: NodeJS.ErrnoException): boolean {
 
 function pipeLabel(error: NodeJS.ErrnoException): string {
   return error.code ? `${error.code}: ${error.message}` : error.message;
+}
+
+function describeError(error: unknown): string {
+  if (error instanceof Error) {
+    const cause = (error as Error & { cause?: unknown }).cause;
+    return cause ? `${error.message}; caused by ${describeError(cause)}` : error.message;
+  }
+  return String(error);
 }
 
 function observeErrors(
@@ -236,10 +244,9 @@ export class StreamingDelegate implements CameraStreamingDelegate {
   async prepareStream(request: PrepareStreamRequest, callback: PrepareStreamCallback): Promise<void> {
     try {
       const ipv6 = request.addressVersion === 'ipv6';
-      const [videoReturnPort, audioReturnPort] = await Promise.all([
-        reservePort(ipv6),
-        reservePort(ipv6),
-      ]);
+      const requestAudio = (request as { audio?: PrepareStreamRequest['audio'] }).audio;
+      const videoReturnPort = await reservePort(ipv6);
+      const audioReturnPort = this.wantAudio && requestAudio ? await reservePort(ipv6) : undefined;
       const info: SessionInfo = {
         address: request.targetAddress,
         ipv6,
@@ -247,11 +254,13 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         videoReturnPort,
         videoSrtp: Buffer.concat([request.video.srtp_key, request.video.srtp_salt]),
         videoSsrc: this.hap.CameraController.generateSynchronisationSource(),
-        audioPort: request.audio.port,
-        audioReturnPort,
-        audioSrtp: Buffer.concat([request.audio.srtp_key, request.audio.srtp_salt]),
-        audioSsrc: this.hap.CameraController.generateSynchronisationSource(),
       };
+      if (this.wantAudio && requestAudio && audioReturnPort) {
+        info.audioPort = requestAudio.port;
+        info.audioReturnPort = audioReturnPort;
+        info.audioSrtp = Buffer.concat([requestAudio.srtp_key, requestAudio.srtp_salt]);
+        info.audioSsrc = this.hap.CameraController.generateSynchronisationSource();
+      }
       this.pending.set(request.sessionID, info);
       callback(undefined, {
         video: {
@@ -260,14 +269,19 @@ export class StreamingDelegate implements CameraStreamingDelegate {
           srtp_key: request.video.srtp_key,
           srtp_salt: request.video.srtp_salt,
         },
-        audio: {
-          port: info.audioReturnPort,
-          ssrc: info.audioSsrc,
-          srtp_key: request.audio.srtp_key,
-          srtp_salt: request.audio.srtp_salt,
-        },
+        ...(info.audioReturnPort !== undefined && info.audioSsrc !== undefined && requestAudio
+          ? {
+            audio: {
+              port: info.audioReturnPort,
+              ssrc: info.audioSsrc,
+              srtp_key: requestAudio.srtp_key,
+              srtp_salt: requestAudio.srtp_salt,
+            },
+          }
+          : {}),
       });
     } catch (error) {
+      this.log.warn(`HomeKit stream preparation failed for ${this.cameraConfig.name}: ${describeError(error)}`);
       callback(error as Error);
     }
   }
@@ -307,6 +321,9 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     );
 
     if (hasAudio) {
+      if (info.audioPort === undefined || !info.audioSrtp) {
+        throw new Error('HomeKit audio endpoint was not prepared');
+      }
       const audio = request.audio;
       args.push('-map', '1:a:0', '-vn', '-sn', '-dn');
       if (audio.codec === this.hap.AudioStreamingCodecType.AAC_ELD) {
@@ -330,6 +347,9 @@ export class StreamingDelegate implements CameraStreamingDelegate {
   }
 
   private returnAudioSdp(request: StartStreamRequest, info: SessionInfo): string {
+    if (info.audioReturnPort === undefined || !info.audioSrtp) {
+      throw new Error('HomeKit talkback endpoint was not prepared');
+    }
     const ipVersion = info.ipv6 ? 'IP6' : 'IP4';
     const payloadType = request.audio.pt;
     const sampleRate = request.audio.sample_rate * 1000;
@@ -425,13 +445,21 @@ export class StreamingDelegate implements CameraStreamingDelegate {
       const camera = this.cameraSession(this.wantAudio);
       let started = false;
       let cleaned = false;
+      let callbackCompleted = false;
+      let startupTimeout: NodeJS.Timeout | undefined;
       let resolveLock!: () => void;
       const holdLock = new Promise<void>((resolve) => { resolveLock = resolve; });
+      const finishCallback = (error?: Error): void => {
+        if (callbackCompleted) return;
+        callbackCompleted = true;
+        callback(error);
+      };
       const active: ActiveSession = {
         camera,
         cleanup: () => {
           if (cleaned) return;
           cleaned = true;
+          if (startupTimeout) clearTimeout(startupTimeout);
           if (active.timeout) clearTimeout(active.timeout);
           try { active.returnSocket?.close(); } catch {}
           active.ffmpeg?.kill('SIGKILL');
@@ -444,10 +472,26 @@ export class StreamingDelegate implements CameraStreamingDelegate {
       };
       this.active.set(request.sessionID, active);
       try {
+        startupTimeout = setTimeout(() => {
+          if (started || cleaned) return;
+          const error = new Error('HomeKit stream startup timed out');
+          this.log.warn(`HomeKit stream failed for ${this.cameraConfig.name}: ${error.message}`);
+          finishCallback(error);
+          active.cleanup();
+        }, 30_000);
+        this.log.info(
+          `Starting HomeKit stream for ${this.cameraConfig.name} `
+          + `(${request.video.width}x${request.video.height}@${request.video.fps}fps)`,
+        );
         await camera.open();
+        if (cleaned) return;
+        const hasHomeKitAudio = Boolean((request as { audio?: StartStreamRequest['audio'] }).audio);
+        const hasAudio = camera.hasAudio && hasHomeKitAudio
+          && info.audioPort !== undefined && info.audioReturnPort !== undefined
+          && info.audioSsrc !== undefined && !!info.audioSrtp;
         const ffmpeg = spawn(
           this.ffmpegPath,
-          this.outputArguments(request, info, camera.hasAudio),
+          this.outputArguments(request, info, hasAudio),
           { stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'] },
         );
         active.ffmpeg = ffmpeg;
@@ -471,24 +515,40 @@ export class StreamingDelegate implements CameraStreamingDelegate {
           frame,
           (error) => handlePipeError('ffmpeg video input', error),
         ));
-        camera.on('audio', (frame: Buffer) => write(
-          audioInput,
-          frame,
-          (error) => handlePipeError('ffmpeg audio input', error),
-        ));
+        if (hasAudio) {
+          camera.on('audio', (frame: Buffer) => write(
+            audioInput,
+            frame,
+            (error) => handlePipeError('ffmpeg audio input', error),
+          ));
+        } else if (this.wantAudio && camera.hasAudio) {
+          this.log.warn(`HomeKit did not prepare audio for ${this.cameraConfig.name}; streaming video-only`);
+        }
         camera.on('error', (error: Error) => {
           this.log.error(`myQ media error: ${error.message}`);
           active.cleanup();
         });
         ffmpeg.stderr?.on('data', (data: Buffer) => this.debugFfmpeg('stream', data));
         ffmpeg.once('error', (error: NodeJS.ErrnoException) => {
-          if (!started) callback(error);
+          if (!started) {
+            this.log.warn(`[${this.cameraConfig.name}] ffmpeg stream process failed before startup: ${pipeLabel(error)}`);
+            finishCallback(error);
+          }
           else if (!isExpectedTeardownError(error)) {
             this.log.warn(`[${this.cameraConfig.name}] ffmpeg stream process failed: ${pipeLabel(error)}`);
           }
           active.cleanup();
         });
-        ffmpeg.once('close', () => active.cleanup());
+        ffmpeg.once('close', (code, signal) => {
+          if (!started && !callbackCompleted) {
+            const error = new Error(
+              `ffmpeg stream exited before startup (code=${code ?? 'null'}, signal=${signal ?? 'null'})`,
+            );
+            this.log.warn(`HomeKit stream failed for ${this.cameraConfig.name}: ${error.message}`);
+            finishCallback(error);
+          }
+          active.cleanup();
+        });
 
         const returnSocket = createSocket(info.ipv6 ? 'udp6' : 'udp4');
         active.returnSocket = returnSocket;
@@ -506,7 +566,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         });
         returnSocket.bind(info.videoReturnPort);
 
-        if (this.wantTalkback && camera.hasAudio) {
+        if (this.wantTalkback && hasAudio) {
           this.log.info(
             `HomeKit push-to-talk ready for ${this.cameraConfig.name} `
             + `(${request.audio.codec}/${request.audio.sample_rate}kHz, `
@@ -515,10 +575,15 @@ export class StreamingDelegate implements CameraStreamingDelegate {
           active.returnFfmpeg = this.startReturnAudio(request, camera, info);
         }
         started = true;
-        callback();
+        if (startupTimeout) clearTimeout(startupTimeout);
+        finishCallback();
         this.log.info(`Started HomeKit stream for ${this.cameraConfig.name}`);
       } catch (error) {
-        if (!started) callback(error as Error);
+        this.log.warn(`HomeKit stream failed for ${this.cameraConfig.name}: ${describeError(error)}`);
+        if (this.config.debug && error instanceof Error && error.stack) {
+          this.log.debug(`[${this.cameraConfig.name}] stream startup stack: ${error.stack}`);
+        }
+        if (!started) finishCallback(error as Error);
         active.cleanup();
       }
       await holdLock;
