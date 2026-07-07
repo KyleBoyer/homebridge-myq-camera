@@ -127,26 +127,36 @@ export class MyqCameraSession extends EventEmitter {
    * change between tries.
    */
   private async establishVideo(attempts = 2): Promise<void> {
+    // Capture stable references: close() nulls this.client/this.camera, and the
+    // retry loop below awaits, so HomeKit tearing the session down mid-setup
+    // must not turn into an undefined dereference. We bail via the `closed`
+    // checks instead.
+    const client = this.client;
+    const camera = this.camera;
+    if (!client || !camera) throw new Error('camera session was torn down before video setup');
     const noop = (): void => {};
     let last: unknown;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-      const info = await this.retry(() => this.client!.getVideoConnection(this.camera!), 2);
-      const session = new P2PMediaSession(this.camera!, info, 'V', 'w1', 90_000);
+      if (this.closed) throw new Error('camera session closed during video setup');
+      const info = await this.retry(() => client.getVideoConnection(camera), 2);
+      const session = new P2PMediaSession(camera, info, 'V', 'w1', 90_000);
       session.on('error', noop); // absorb transient socket errors during the punch
       try {
         await session.punch(8_000);
       } catch (error) {
         last = error;
         session.close();
-        if (attempt + 1 < attempts) {
-          this.log.warn(
-            `myQ video hole punch failed (attempt ${attempt + 1}/${attempts}); the camera `
-            + 'may still be releasing a prior session — retrying after a cooldown',
-          );
-          await delay(4_000);
-          continue;
-        }
-        throw last;
+        if (this.closed || attempt + 1 >= attempts) throw last;
+        this.log.warn(
+          `myQ video hole punch failed (attempt ${attempt + 1}/${attempts}); the camera `
+          + 'may still be releasing a prior session — retrying after a cooldown',
+        );
+        await delay(4_000);
+        continue;
+      }
+      if (this.closed) {
+        session.close();
+        throw new Error('camera session closed during video setup');
       }
       session.removeListener('error', noop);
       const gate = new KeyframeGate();
@@ -156,9 +166,9 @@ export class MyqCameraSession extends EventEmitter {
       session.on('error', (error) => this.emit('error', error));
       this.video = session;
       this.videoInfo = info;
-      this.client!.startVideo(this.camera!, info);
-      this.client!.setVideoQuality(
-        this.camera!,
+      client.startVideo(camera, info);
+      client.setVideoQuality(
+        camera,
         this.options.quality ?? 3,
         this.options.fps ?? 20,
         this.options.size ?? 0,

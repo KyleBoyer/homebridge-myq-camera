@@ -5,6 +5,15 @@ All notable changes to `homebridge-myq-camera` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.11] - 2026-07-07
+
+### Fixed
+- Fixed a crash (`Cannot read properties of undefined (reading 'getVideoConnection')`)
+  when HomeKit tore down a stream while the plugin was still retrying the video
+  hole punch. The session now captures stable client/camera references and aborts
+  the setup cleanly if it is closed mid-punch instead of dereferencing a nulled
+  client.
+
 ## [0.2.10] - 2026-07-07
 
 ### Fixed
@@ -90,6 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Device-free OAuth refresh-token rotation, native CXS signaling, and SDNK LAN
   hole-punching — no phone, Python, or external media server required.
 
+[0.2.11]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.10...v0.2.11
 [0.2.10]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.7...v0.2.8
