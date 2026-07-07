@@ -5,6 +5,17 @@ All notable changes to `homebridge-myq-camera` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.13] - 2026-07-07
+
+### Fixed
+- Fixed a 0.2.12 regression where the persisted snapshot loaded as *stale*, so
+  the first tile poll after a restart spawned a background snapshot session that
+  competed with — and failed — the stream a user started moments later (`camera
+  session closed during video setup` / `Seedonk hole punch timed out`). The
+  snapshot now loads fresh, and background refreshes are debounced to fire only
+  after the tile has been viewed continuously for a while, never in the
+  open-app-then-start-stream window.
+
 ## [0.2.12] - 2026-07-07
 
 ### Added
@@ -110,6 +121,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Device-free OAuth refresh-token rotation, native CXS signaling, and SDNK LAN
   hole-punching — no phone, Python, or external media server required.
 
+[0.2.13]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.12...v0.2.13
 [0.2.12]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.11...v0.2.12
 [0.2.11]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.10...v0.2.11
 [0.2.10]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.9...v0.2.10

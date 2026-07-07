@@ -123,6 +123,8 @@ export class StreamingDelegate implements CameraStreamingDelegate {
   private sessionLock: Promise<void> = Promise.resolve();
   private lastSnapshot?: Buffer;
   private lastSnapshotAt = 0;
+  private lastSnapshotPollAt = 0;
+  private viewingStartedAt = 0;
   private readonly snapshotFile: string;
   private readonly snapshotTtlMs: number;
   private snapshotRefreshing = false;
@@ -160,8 +162,10 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     this.snapshotTtlMs = interval === 0 ? 0 : Math.max(15, interval ?? 120) * 1000;
     try {
       this.lastSnapshot = readFileSync(this.snapshotFile);
-      // Treat a loaded snapshot as stale so it refreshes on first view.
-      this.lastSnapshotAt = this.snapshotTtlMs ? Date.now() - this.snapshotTtlMs : Date.now();
+      // Load as fresh: a restart must NOT open a snapshot session, or it would
+      // race the stream a user starts moments later on this single-viewer
+      // camera. Staleness is handled later, only after sustained tile viewing.
+      this.lastSnapshotAt = Date.now();
     } catch {
       // no persisted snapshot yet — the first request takes a live one
     }
@@ -268,16 +272,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     // classic snapshot→stream hole-punch collision.
     if (this.lastSnapshot) {
       callback(undefined, this.lastSnapshot);
-      // If the cached still is stale, refresh it in the background so the next
-      // poll (HomeKit refreshes a visible tile ~every 10s) shows a current
-      // frame — without blocking this response or holding a live stream. Only
-      // while not streaming (a stream refreshes the cache itself) and when
-      // enabled (interval > 0).
-      if (this.snapshotTtlMs > 0
-        && this.active.size === 0
-        && Date.now() - this.lastSnapshotAt > this.snapshotTtlMs) {
-        this.captureSnapshot(request.width, request.height);
-      }
+      this.maybeRefreshStaleSnapshot(request.width, request.height);
       return;
     }
     if (this.active.size > 0) {
@@ -286,6 +281,25 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     }
     // Cold cache (first ever use): capture a live still and answer with it.
     this.captureSnapshot(request.width, request.height, callback);
+  }
+
+  /**
+   * Refresh a stale cached still in the background, but only once the tile has
+   * been viewed continuously for a while. HomeKit polls a visible tile roughly
+   * every 10s; a user who opens the app and taps to stream produces just one or
+   * two polls before the stream, so debouncing here guarantees we never spawn a
+   * competing snapshot session in that window — which on a single-viewer camera
+   * would race the stream's hole punch. Refresh only kicks in for sustained
+   * tile-watching, when a stream is not imminent.
+   */
+  private maybeRefreshStaleSnapshot(width: number, height: number): void {
+    if (this.snapshotTtlMs <= 0 || this.active.size > 0 || this.snapshotRefreshing) return;
+    const now = Date.now();
+    if (now - this.lastSnapshotPollAt > 15_000) this.viewingStartedAt = now;
+    this.lastSnapshotPollAt = now;
+    if (now - this.lastSnapshotAt <= this.snapshotTtlMs) return;
+    if (now - this.viewingStartedAt < 25_000) return;
+    this.captureSnapshot(width, height);
   }
 
   /**
