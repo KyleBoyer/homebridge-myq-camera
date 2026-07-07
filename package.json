@@ -1,7 +1,7 @@
 {
   "displayName": "Homebridge myQ Camera (TC)",
   "name": "homebridge-myq-camera",
-  "version": "0.2.11",
+  "version": "0.2.12",
   "description": "Native HomeKit camera plugin for legacy TC-series (Tend/Seedonk) myQ garage cameras.",
   "author": "Kyle Boyer",
   "license": "MIT",

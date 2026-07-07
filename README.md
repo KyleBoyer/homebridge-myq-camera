@@ -147,8 +147,15 @@ camera its own HomeKit pairing QR code.
 ## Operational behavior
 
 The camera allows one live viewer. The plugin holds one native session for each HomeKit
-stream and routes video, camera audio, RTCP, and talkback through it. Snapshots are
-serialized; while live video is active HomeKit receives the last cached snapshot.
+stream and routes video, camera audio, RTCP, and talkback through it.
+
+Snapshots are served from a cached still rather than opening a competing camera session
+right before a stream (which would race the stream's hole punch on a single-viewer
+camera). The cache is refreshed from live streams, persisted to the storage directory so
+a restart starts warm, and — when a visible tile is polled and the cached still is older
+than `snapshotRefreshInterval` seconds (default 120) — refreshed in the background so the
+tile stays reasonably current between streams. Set `snapshotRefreshInterval` to `0` to
+refresh snapshots only while streaming.
 
 Push-to-talk return audio is decrypted from HomeKit SRTP by FFmpeg, converted once to
 8 kHz μ-law, and injected into the existing Seedonk audio channel. Camera audio travels

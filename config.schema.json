@@ -48,6 +48,13 @@
         "type": "boolean",
         "default": false
       },
+      "snapshotRefreshInterval": {
+        "title": "Snapshot refresh interval (seconds)",
+        "type": "integer",
+        "default": 120,
+        "minimum": 0,
+        "description": "How stale a cached snapshot may be before it is refreshed in the background (the tile keeps showing the cached image until the fresh one is ready). Lower = fresher tiles but more brief camera sessions. Set to 0 to only refresh snapshots while streaming."
+      },
       "cameras": {
         "title": "Cameras",
         "type": "array",

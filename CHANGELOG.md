@@ -5,6 +5,17 @@ All notable changes to `homebridge-myq-camera` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.12] - 2026-07-07
+
+### Added
+- Background snapshot refresh so cached stills don't go stale between streams.
+  When HomeKit polls a visible camera tile and the cached snapshot is older than
+  the refresh interval, the plugin fetches a fresh still in the background (the
+  tile keeps showing the cached image until the new one is ready — the response
+  is never blocked). New `snapshotRefreshInterval` option (seconds, default 120;
+  set to 0 to only refresh while streaming). A persisted snapshot loads as stale
+  so the first view after a restart pulls a current frame.
+
 ## [0.2.11] - 2026-07-07
 
 ### Fixed
@@ -99,6 +110,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Device-free OAuth refresh-token rotation, native CXS signaling, and SDNK LAN
   hole-punching — no phone, Python, or external media server required.
 
+[0.2.12]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.11...v0.2.12
 [0.2.11]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.10...v0.2.11
 [0.2.10]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.8...v0.2.9

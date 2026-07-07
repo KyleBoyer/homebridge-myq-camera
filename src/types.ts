@@ -15,6 +15,7 @@ export interface MyqPlatformConfig extends PlatformConfig {
   talkback?: boolean;
   copyVideo?: boolean;
   debug?: boolean;
+  snapshotRefreshInterval?: number;
   cameras?: CameraConfig[];
 }
 

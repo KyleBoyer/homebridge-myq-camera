@@ -124,6 +124,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
   private lastSnapshot?: Buffer;
   private lastSnapshotAt = 0;
   private readonly snapshotFile: string;
+  private readonly snapshotTtlMs: number;
   private snapshotRefreshing = false;
 
   private readonly wantAudio: boolean;
@@ -151,9 +152,16 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     const slug = (cameraConfig.deviceId || cameraConfig.name || 'camera')
       .replace(/[^\w.-]+/g, '_');
     this.snapshotFile = join(api.user.storagePath(), 'myq-camera', `snapshot-${slug}.jpg`);
+    // How stale a cached still may be before it is refreshed in the background.
+    // Default 120s; 0 disables background refresh (serve cache until the next
+    // stream). A persisted snapshot loads as already stale so the first poll
+    // after a restart triggers a refresh.
+    const interval = config.snapshotRefreshInterval;
+    this.snapshotTtlMs = interval === 0 ? 0 : Math.max(15, interval ?? 120) * 1000;
     try {
       this.lastSnapshot = readFileSync(this.snapshotFile);
-      this.lastSnapshotAt = Date.now();
+      // Treat a loaded snapshot as stale so it refreshes on first view.
+      this.lastSnapshotAt = this.snapshotTtlMs ? Date.now() - this.snapshotTtlMs : Date.now();
     } catch {
       // no persisted snapshot yet — the first request takes a live one
     }
@@ -223,8 +231,8 @@ export class StreamingDelegate implements CameraStreamingDelegate {
    */
   private refreshSnapshotFromStream(camera: MyqCameraSession): void {
     if (this.snapshotRefreshing) return;
-    // A cache younger than a couple of minutes is fresh enough.
-    if (this.lastSnapshot && Date.now() - this.lastSnapshotAt < 120_000) return;
+    // Skip if the cached still is already fresh enough.
+    if (this.lastSnapshot && Date.now() - this.lastSnapshotAt < (this.snapshotTtlMs || 120_000)) return;
     this.snapshotRefreshing = true;
     const ffmpeg = spawn(this.ffmpegPath, [
       '-hide_banner', '-loglevel', 'error',
@@ -254,20 +262,43 @@ export class StreamingDelegate implements CameraStreamingDelegate {
   }
 
   handleSnapshotRequest(request: SnapshotRequest, callback: SnapshotRequestCallback): void {
-    // Serve the cached still whenever we have one. Opening a dedicated snapshot
-    // session would take the camera's single viewer slot moments before HomeKit
-    // starts a stream, and the camera needs time to release it — the classic
-    // snapshot→stream hole-punch collision. The cache is refreshed from live
-    // streams and persisted across restarts, so this only opens a session on a
-    // genuinely cold cache (first ever use).
+    // Serve the cached still instantly whenever we have one. Opening a dedicated
+    // snapshot session would take the camera's single viewer slot moments before
+    // HomeKit starts a stream, and the camera needs time to release it — the
+    // classic snapshot→stream hole-punch collision.
     if (this.lastSnapshot) {
       callback(undefined, this.lastSnapshot);
+      // If the cached still is stale, refresh it in the background so the next
+      // poll (HomeKit refreshes a visible tile ~every 10s) shows a current
+      // frame — without blocking this response or holding a live stream. Only
+      // while not streaming (a stream refreshes the cache itself) and when
+      // enabled (interval > 0).
+      if (this.snapshotTtlMs > 0
+        && this.active.size === 0
+        && Date.now() - this.lastSnapshotAt > this.snapshotTtlMs) {
+        this.captureSnapshot(request.width, request.height);
+      }
       return;
     }
     if (this.active.size > 0) {
       callback(new Error('camera is streaming; snapshot will be available shortly'));
       return;
     }
+    // Cold cache (first ever use): capture a live still and answer with it.
+    this.captureSnapshot(request.width, request.height, callback);
+  }
+
+  /**
+   * Capture one live still into the cache (and disk), optionally answering a
+   * HomeKit snapshot request. Opens a short video-only session, so callers must
+   * only invoke it when not already streaming; concurrent captures are skipped.
+   */
+  private captureSnapshot(width: number, height: number, callback?: SnapshotRequestCallback): void {
+    if (this.snapshotRefreshing) {
+      callback?.(new Error('a snapshot capture is already in progress'), this.lastSnapshot);
+      return;
+    }
+    this.snapshotRefreshing = true;
     this.withSession(async () => {
       const camera = this.cameraSession(false);
       const ffmpeg = spawn(this.ffmpegPath, [
@@ -275,8 +306,8 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         '-f', 'h264', '-i', 'pipe:0',
         '-frames:v', '1',
         '-vf',
-        `scale=${request.width}:${request.height}:force_original_aspect_ratio=decrease,`
-          + `pad=${request.width}:${request.height}:(ow-iw)/2:(oh-ih)/2`,
+        `scale=${width}:${height}:force_original_aspect_ratio=decrease,`
+          + `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`,
         '-f', 'image2', 'pipe:1',
       ]);
       const chunks: Buffer[] = [];
@@ -287,9 +318,10 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         clearTimeout(timeout);
         camera.close();
         ffmpeg.kill('SIGKILL');
+        this.snapshotRefreshing = false;
         const image = chunks.length ? Buffer.concat(chunks) : undefined;
         if (image) void this.persistSnapshot(image);
-        callback(error ?? (image ? undefined : new Error('snapshot produced no image')), image);
+        callback?.(error ?? (image ? undefined : new Error('snapshot produced no image')), image);
       };
       const timeout = setTimeout(() => finish(new Error('snapshot timeout')), 15_000);
       ffmpeg.stdout.on('data', (data: Buffer) => chunks.push(data));
