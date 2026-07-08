@@ -146,16 +146,19 @@ camera its own HomeKit pairing QR code.
 
 ## Operational behavior
 
-The camera allows one live viewer. The plugin holds one native session for each HomeKit
-stream and routes video, camera audio, RTCP, and talkback through it.
+The camera itself allows one live viewer, so the plugin holds a **single shared session**
+that every snapshot and every HomeKit stream multiplexes over. This dissolves the classic
+snapshot→stream hole-punch collision (they no longer compete), keeps snapshots fresh
+straight off the live feed, and lets **multiple HomeKit clients watch at once** (phone +
+iPad) even though the camera only serves one viewer directly.
 
-Snapshots are served from a cached still rather than opening a competing camera session
-right before a stream (which would race the stream's hole punch on a single-viewer
-camera). The cache is refreshed from live streams, persisted to the storage directory so
-a restart starts warm, and — when a visible tile is polled and the cached still is older
-than `snapshotRefreshInterval` seconds (default 120) — refreshed in the background so the
-tile stays reasonably current between streams. Set `snapshotRefreshInterval` to `0` to
-refresh snapshots only while streaming.
+The session is opened on demand (a snapshot or stream request) and kept warm for
+`keepAliveSeconds` (default 60) after the last one finishes, so a follow-up request reuses
+it instantly instead of re-punching. Snapshots are served from a cached still immediately
+(persisted to the storage directory so a restart is never blank) and refreshed from the
+shared feed when older than `snapshotRefreshInterval` seconds (default 15; `0` = only
+refresh while a stream is running). `maxViewers` caps concurrent streams (default `0` =
+unlimited, mapped to 8 since HomeKit needs a concrete count).
 
 Push-to-talk return audio is decrypted from HomeKit SRTP by FFmpeg, converted once to
 8 kHz μ-law, and injected into the existing Seedonk audio channel. Camera audio travels

@@ -2,7 +2,7 @@ const NAL_IDR = 5;
 const NAL_SPS = 7;
 const NAL_PPS = 8;
 
-function nals(data: Buffer): Array<{ type: number; data: Buffer }> {
+export function nals(data: Buffer): Array<{ type: number; data: Buffer }> {
   const starts: number[] = [];
   for (let index = 0; index + 3 <= data.length;) {
     if (data[index] === 0 && data[index + 1] === 0 && data[index + 2] === 1) {
@@ -27,10 +27,23 @@ function nals(data: Buffer): Array<{ type: number; data: Buffer }> {
   });
 }
 
+export const SPS_NAL = NAL_SPS;
+export const PPS_NAL = NAL_PPS;
+
 export class KeyframeGate {
   private open = false;
   private sps?: Buffer;
   private pps?: Buffer;
+
+  /**
+   * Seed the gate with already-known SPS/PPS (e.g. a late viewer joining a
+   * stream in progress) so it can open on the next IDR without waiting for the
+   * headers to recur.
+   */
+  constructor(sps?: Buffer, pps?: Buffer) {
+    this.sps = sps;
+    this.pps = pps;
+  }
 
   feed(accessUnit: Buffer): Buffer[] {
     let idr = false;

@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { TokenManager } from './auth';
 import { TendClient } from './cxs';
-import { KeyframeGate } from './h264';
+import { KeyframeGate, PPS_NAL, SPS_NAL, nals } from './h264';
 import { P2PMediaSession } from './p2p';
 import type { Camera, ConnectionInfo, PluginLogger } from './types';
 
@@ -87,6 +87,195 @@ export class TendConnectionManager {
 
   close(): void {
     this.invalidate();
+  }
+}
+
+/**
+ * A single, shared, reference-counted camera session that both snapshots and
+ * live streams multiplex over. The TC camera serves exactly one viewer, so
+ * instead of each snapshot/stream opening a competing session, they all
+ * `acquire()` this one — dissolving the snapshot→stream hole-punch collision
+ * and letting multiple HomeKit viewers watch at once. When the last consumer
+ * releases, the session is kept warm for `keepAliveMs` so a follow-up request
+ * (another snapshot, or tapping into live view) reuses it instantly.
+ */
+export class SharedCameraSession extends EventEmitter {
+  private session?: MyqCameraSession;
+  private pending?: Promise<MyqCameraSession>;
+  private consumers = 0;
+  private idleTimer?: NodeJS.Timeout;
+  private closed = false;
+  private sps?: Buffer;
+  private pps?: Buffer;
+
+  /**
+   * Optional hook run once, on the still-open session, right before the warm
+   * keep-alive window closes it — used to grab a final fresh still so the tile
+   * reflects the last frame after the stream is torn down. Bounded so it never
+   * delays teardown for long.
+   */
+  onIdle?: () => Promise<void>;
+
+  constructor(
+    private readonly factory: () => MyqCameraSession,
+    private readonly log: PluginLogger,
+    private readonly keepAliveMs: number,
+  ) {
+    super();
+    this.setMaxListeners(0); // multi-viewer: an unbounded number of consumers
+  }
+
+  /** True while the underlying camera session is open (streaming or warm). */
+  get open(): boolean {
+    return this.session !== undefined;
+  }
+
+  get hasAudio(): boolean {
+    return this.session?.hasAudio ?? false;
+  }
+
+  /** Latest SPS/PPS seen on the feed, to seed a late viewer's keyframe gate. */
+  get videoHeaders(): { sps?: Buffer; pps?: Buffer } {
+    return { sps: this.sps, pps: this.pps };
+  }
+
+  /** Open the session if needed and register a consumer. Balance with release(). */
+  async acquire(): Promise<void> {
+    if (this.closed) throw new Error('shared camera session is shut down');
+    this.consumers += 1;
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = undefined;
+    }
+    if (this.session) return;
+    if (this.pending) {
+      try {
+        await this.pending;
+      } catch (error) {
+        this.consumers = Math.max(0, this.consumers - 1);
+        throw error;
+      }
+      return;
+    }
+    this.pending = this.openInternal();
+    try {
+      await this.pending;
+    } catch (error) {
+      this.consumers = Math.max(0, this.consumers - 1);
+      throw error;
+    } finally {
+      this.pending = undefined;
+    }
+  }
+
+  private async openInternal(): Promise<MyqCameraSession> {
+    const session = this.factory();
+    let openError: Error | undefined;
+    // Capture errors emitted before the session is adopted with a local handler,
+    // so they can't run this.onError() — which would teardown() and reset the
+    // consumer count while this open is still in flight (corrupting the refcount
+    // once the open resolves).
+    const onOpenError = (error: Error): void => { openError ??= error; };
+    session.on('video', this.onVideo);
+    session.on('audio', this.onAudio);
+    session.on('error', onOpenError);
+    const abandon = (): void => {
+      session.removeListener('video', this.onVideo);
+      session.removeListener('audio', this.onAudio);
+      session.removeListener('error', onOpenError);
+      session.close();
+    };
+    try {
+      await session.open();
+    } catch (error) {
+      abandon();
+      throw error;
+    }
+    // Do not adopt a session that errored during open, or that shutdown() closed
+    // out from under us — either would leak (and shutdown's session would keep
+    // its keepalive timer alive past shutdown).
+    if (this.closed || openError) {
+      abandon();
+      throw openError ?? new Error('shared camera session was shut down during open');
+    }
+    // Adopt: swap the local open-time handler for the real one (synchronous, so
+    // no error can slip through in between).
+    session.on('error', this.onError);
+    session.removeListener('error', onOpenError);
+    this.session = session;
+    return session;
+  }
+
+  private readonly onVideo = (frame: Buffer): void => {
+    for (const unit of nals(frame)) {
+      if (unit.type === SPS_NAL) this.sps = unit.data;
+      else if (unit.type === PPS_NAL) this.pps = unit.data;
+    }
+    this.emit('video', frame);
+  };
+
+  private readonly onAudio = (frame: Buffer): void => { this.emit('audio', frame); };
+
+  private readonly onError = (error: Error): void => {
+    this.log.error(`myQ shared camera session error: ${error.message}`);
+    this.teardown();
+    // Notify consumers so they clean up; guard against the EventEmitter throw
+    // when nobody is currently listening for 'error'.
+    if (this.listenerCount('error') > 0) this.emit('error', error);
+  };
+
+  /** Release a consumer; when the last one leaves, keep the session warm. */
+  release(): void {
+    this.consumers = Math.max(0, this.consumers - 1);
+    if (this.consumers === 0 && this.session && !this.idleTimer) {
+      this.idleTimer = setTimeout(() => { void this.idleClose(); }, this.keepAliveMs);
+    }
+  }
+
+  private async idleClose(): Promise<void> {
+    this.idleTimer = undefined;
+    if (this.closed || this.consumers > 0 || !this.session) return;
+    if (this.onIdle) {
+      // Capture a final still off the still-open session before tearing it down,
+      // so the tile reflects the last frame. Bounded so a stuck capture can't
+      // hold the session open.
+      try {
+        await Promise.race([this.onIdle(), delay(3_000)]);
+      } catch {
+        // best-effort
+      }
+    }
+    // A consumer may have acquired during the final capture — only tear down if
+    // still idle.
+    if (this.consumers === 0 && this.session) this.teardown();
+  }
+
+  writeTalkback(data: Buffer): void {
+    this.session?.writeTalkback(data);
+  }
+
+  private teardown(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = undefined;
+    }
+    const session = this.session;
+    this.session = undefined;
+    this.consumers = 0;
+    this.sps = undefined;
+    this.pps = undefined;
+    if (session) {
+      session.removeListener('video', this.onVideo);
+      session.removeListener('audio', this.onAudio);
+      session.removeListener('error', this.onError);
+      session.close();
+    }
+  }
+
+  shutdown(): void {
+    this.closed = true;
+    this.teardown();
+    this.removeAllListeners();
   }
 }
 

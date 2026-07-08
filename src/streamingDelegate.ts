@@ -18,8 +18,12 @@ import type {
   StreamingRequest,
   StreamRequestCallback,
 } from 'homebridge';
-import { MyqCameraSession, TendConnectionManager } from './session';
+import { KeyframeGate } from './h264';
+import { MyqCameraSession, SharedCameraSession, TendConnectionManager } from './session';
 import type { CameraConfig, MyqPlatformConfig, PluginLogger } from './types';
+
+// HAP needs a concrete stream count; treat "unlimited" (0/unset) as this cap.
+const UNLIMITED_VIEWERS = 8;
 
 interface SessionInfo {
   address: string;
@@ -35,11 +39,6 @@ interface SessionInfo {
 }
 
 interface ActiveSession {
-  camera: MyqCameraSession;
-  ffmpeg?: ChildProcess;
-  returnFfmpeg?: ChildProcess;
-  returnSocket?: Socket;
-  timeout?: NodeJS.Timeout;
   cleanup: (reason?: string) => void;
 }
 
@@ -120,13 +119,11 @@ export class StreamingDelegate implements CameraStreamingDelegate {
   readonly controller: CameraController;
   private readonly pending = new Map<string, SessionInfo>();
   private readonly active = new Map<string, ActiveSession>();
-  private sessionLock: Promise<void> = Promise.resolve();
+  private readonly shared: SharedCameraSession;
   private lastSnapshot?: Buffer;
   private lastSnapshotAt = 0;
-  private lastSnapshotPollAt = 0;
-  private viewingStartedAt = 0;
   private readonly snapshotFile: string;
-  private readonly snapshotTtlMs: number;
+  private readonly snapshotRefreshMs: number;
   private snapshotRefreshing = false;
 
   private readonly wantAudio: boolean;
@@ -138,7 +135,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     private readonly log: PluginLogger,
     private readonly config: MyqPlatformConfig,
     private readonly cameraConfig: CameraConfig,
-    private readonly connection: TendConnectionManager,
+    connection: TendConnectionManager,
     private readonly ffmpegPath: string,
     api: API,
   ) {
@@ -146,28 +143,38 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     this.wantTalkback = this.wantAudio && config.talkback !== false;
     this.copyVideo = config.copyVideo === true;
 
-    // Persist snapshots to the Homebridge storage dir so a restart (or update)
-    // serves the last still without opening a fresh camera session — a TC
-    // camera serves one viewer at a time, and HomeKit fetches a snapshot right
-    // before it starts a stream, so a cold snapshot session would race the
-    // stream's hole punch.
+    // One shared, ref-counted camera session for snapshots + streams. Opened
+    // with audio when wanted so a follow-up stream gets audio from a warm
+    // session without reopening.
+    const keepAliveMs = Math.max(10, config.keepAliveSeconds ?? 60) * 1000;
+    this.shared = new SharedCameraSession(
+      () => new MyqCameraSession(connection, this.log, {
+        camera: this.cameraConfig.deviceId,
+        audio: this.wantAudio,
+      }),
+      this.log,
+      keepAliveMs,
+    );
+    // Grab a final still right before the warm session idles out, so the tile
+    // reflects the last frame after the stream is gone.
+    this.shared.onIdle = () => this.captureFinalStill();
+
+    // Persist snapshots to the Homebridge storage dir so a restart serves the
+    // last still instantly (and the tile is never blank while a fresh one
+    // renders).
     const slug = (cameraConfig.deviceId || cameraConfig.name || 'camera')
       .replace(/[^\w.-]+/g, '_');
     this.snapshotFile = join(api.user.storagePath(), 'myq-camera', `snapshot-${slug}.jpg`);
-    // How stale a cached still may be before it is refreshed in the background.
-    // Default 120s; 0 disables background refresh (serve cache until the next
-    // stream). A persisted snapshot loads as already stale so the first poll
-    // after a restart triggers a refresh.
+    // How stale a cached still may be before a snapshot request refreshes it
+    // from the shared session (opening it if closed). 0 = never open the
+    // session just for a snapshot — only refresh while a stream is running.
     const interval = config.snapshotRefreshInterval;
-    this.snapshotTtlMs = interval === 0 ? 0 : Math.max(15, interval ?? 120) * 1000;
+    this.snapshotRefreshMs = interval === 0 ? 0 : Math.max(5, interval ?? 15) * 1000;
     try {
       this.lastSnapshot = readFileSync(this.snapshotFile);
-      // Load as fresh: a restart must NOT open a snapshot session, or it would
-      // race the stream a user starts moments later on this single-viewer
-      // camera. Staleness is handled later, only after sustained tile viewing.
       this.lastSnapshotAt = Date.now();
     } catch {
-      // no persisted snapshot yet — the first request takes a live one
+      // no persisted snapshot yet — the first request captures a live one
     }
 
     const resolutions: Array<[number, number, number]> = this.copyVideo
@@ -197,24 +204,30 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         }],
       };
     }
+    // Concurrent HomeKit viewers all multiplex the one shared session, so the
+    // camera's single-viewer limit no longer caps us. HAP needs a concrete
+    // count; 0/unset means "unlimited" -> a generous cap.
+    const configuredViewers = config.maxViewers;
+    const cameraStreamCount = !configuredViewers
+      ? UNLIMITED_VIEWERS
+      : Math.max(1, Math.min(16, configuredViewers));
     this.controller = new hap.CameraController({
-      cameraStreamCount: 1,
+      cameraStreamCount,
       delegate: this,
       streamingOptions,
     });
     api.on('shutdown', () => this.shutdown());
   }
 
-  private cameraSession(audio = this.wantAudio): MyqCameraSession {
-    return new MyqCameraSession(this.connection, this.log, {
-      camera: this.cameraConfig.deviceId,
-      audio,
+  /** Capture one last still off the still-open session before it idles out. */
+  private captureFinalStill(): Promise<void> {
+    return new Promise((resolve) => {
+      if (!this.shared.open || this.snapshotRefreshing) {
+        resolve();
+        return;
+      }
+      this.refreshSnapshot(1280, 720, false, () => resolve());
     });
-  }
-
-  private withSession(operation: () => Promise<void>): void {
-    const run = this.sessionLock.then(operation);
-    this.sessionLock = run.catch((error) => this.log.error(String(error)));
   }
 
   private async persistSnapshot(image: Buffer): Promise<void> {
@@ -228,139 +241,108 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     }
   }
 
+  handleSnapshotRequest(request: SnapshotRequest, callback: SnapshotRequestCallback): void {
+    // Serve the cached still instantly, then refresh it from the shared session
+    // in the background (opening the session if needed and keeping it warm) so
+    // the next poll is current. A live stream keeps the session open, so during
+    // viewing snapshots are always fresh and never open a competing session.
+    if (this.lastSnapshot) {
+      callback(undefined, this.lastSnapshot);
+      if (this.shared.open) {
+        // Session already open (streaming or in the warm keep-alive window) —
+        // refresh the tile passively off the live feed, without opening a new
+        // session or extending the keep-alive timer.
+        this.refreshSnapshot(request.width, request.height, false);
+      } else if (this.snapshotRefreshMs > 0
+        && Date.now() - this.lastSnapshotAt >= this.snapshotRefreshMs) {
+        // Cache is stale and the session is closed — open one to refresh it and
+        // keep it warm. snapshotRefreshInterval=0 disables this, so snapshots
+        // only refresh while a session is already open.
+        this.refreshSnapshot(request.width, request.height, true);
+      }
+      return;
+    }
+    // Cold cache (first ever use): open a session, capture a still, answer.
+    this.refreshSnapshot(request.width, request.height, true, callback);
+  }
+
   /**
-   * Refresh the cached still from an active stream so snapshots stay current
-   * without ever opening a competing session. Taps the video frames already
-   * flowing from the camera into a one-shot FFmpeg that emits a single JPEG.
+   * Capture one still from the shared session into the cache (and disk),
+   * optionally answering a HomeKit snapshot request. The FFmpeg handler is
+   * attached before `acquire()` so a cold open's first keyframe is captured.
    */
-  private refreshSnapshotFromStream(camera: MyqCameraSession): void {
-    if (this.snapshotRefreshing) return;
-    // Skip if the cached still is already fresh enough.
-    if (this.lastSnapshot && Date.now() - this.lastSnapshotAt < (this.snapshotTtlMs || 120_000)) return;
+  private refreshSnapshot(
+    width: number,
+    height: number,
+    acquireSession: boolean,
+    callback?: SnapshotRequestCallback,
+  ): void {
+    if (this.snapshotRefreshing) {
+      callback?.(this.lastSnapshot ? undefined : new Error('a snapshot capture is in progress'), this.lastSnapshot);
+      return;
+    }
+    // Passive capture (no acquire) reads an already-open session — it neither
+    // opens one nor resets the keep-alive timer, so tile polls during the warm
+    // window stay fresh without holding the session open indefinitely.
+    if (!acquireSession && !this.shared.open) {
+      callback?.(this.lastSnapshot ? undefined : new Error('camera session not open'), this.lastSnapshot);
+      return;
+    }
     this.snapshotRefreshing = true;
+    // Gate so the still decodes from a clean SPS/PPS/IDR even mid-stream.
+    const gate = new KeyframeGate(this.shared.videoHeaders.sps, this.shared.videoHeaders.pps);
     const ffmpeg = spawn(this.ffmpegPath, [
       '-hide_banner', '-loglevel', 'error',
       '-f', 'h264', '-i', 'pipe:0',
-      '-frames:v', '1', '-f', 'image2', 'pipe:1',
+      '-frames:v', '1',
+      '-vf',
+      `scale=${width}:${height}:force_original_aspect_ratio=decrease,`
+        + `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`,
+      '-f', 'image2', 'pipe:1',
     ]);
     const chunks: Buffer[] = [];
-    const onVideo = (frame: Buffer): void => write(ffmpeg.stdin, frame, () => {});
+    const onVideo = (frame: Buffer): void => {
+      for (const out of gate.feed(frame)) write(ffmpeg.stdin, out, () => {});
+    };
+    const onError = (error: Error): void => finish(error);
     let done = false;
-    const finish = (): void => {
+    let acquired = false;
+    const finish = (error?: Error): void => {
       if (done) return;
       done = true;
       clearTimeout(guard);
-      camera.removeListener('video', onVideo);
-      this.snapshotRefreshing = false;
+      this.shared.removeListener('video', onVideo);
+      this.shared.removeListener('error', onError);
       ffmpeg.kill('SIGKILL');
-      if (chunks.length) void this.persistSnapshot(Buffer.concat(chunks));
+      this.snapshotRefreshing = false;
+      if (acquired) this.shared.release();
+      const image = chunks.length ? Buffer.concat(chunks) : undefined;
+      if (image) void this.persistSnapshot(image);
+      callback?.(error ?? (image ? undefined : new Error('snapshot produced no image')), image ?? this.lastSnapshot);
     };
-    const guard = setTimeout(finish, 8_000);
+    const guard = setTimeout(() => finish(new Error('snapshot timeout')), 15_000);
     ffmpeg.stdout.on('data', (data: Buffer) => chunks.push(data));
-    observeErrors(ffmpeg.stdin, () => {});
-    observeErrors(ffmpeg.stdout, () => {});
-    observeErrors(ffmpeg.stderr, () => {});
+    ffmpeg.stderr.on('data', (data: Buffer) => this.debugFfmpeg('snapshot', data));
+    observeErrors(ffmpeg.stdin, (error) => { if (!done && !isExpectedTeardownError(error)) finish(error); });
+    observeErrors(ffmpeg.stdout, (error) => { if (!done && !isExpectedTeardownError(error)) finish(error); });
+    observeErrors(ffmpeg.stderr, (error) => { if (!done && !isExpectedTeardownError(error)) finish(error); });
     ffmpeg.once('error', finish);
-    ffmpeg.once('close', finish);
-    camera.on('video', onVideo);
-  }
-
-  handleSnapshotRequest(request: SnapshotRequest, callback: SnapshotRequestCallback): void {
-    // Serve the cached still instantly whenever we have one. Opening a dedicated
-    // snapshot session would take the camera's single viewer slot moments before
-    // HomeKit starts a stream, and the camera needs time to release it — the
-    // classic snapshot→stream hole-punch collision.
-    if (this.lastSnapshot) {
-      callback(undefined, this.lastSnapshot);
-      this.maybeRefreshStaleSnapshot(request.width, request.height);
-      return;
+    ffmpeg.once('close', () => finish());
+    // Listen for shared-session errors so a cold snapshot fails fast instead of
+    // waiting out the 15s timeout (and so SharedCameraSession actually emits).
+    this.shared.on('error', onError);
+    this.shared.on('video', onVideo);
+    if (acquireSession) {
+      this.shared.acquire().then(() => {
+        if (done) {
+          // Finished (e.g. timed out) before the open completed — release now.
+          this.shared.release();
+          return;
+        }
+        acquired = true;
+      }).catch((error) => finish(error as Error));
     }
-    if (this.active.size > 0) {
-      callback(new Error('camera is streaming; snapshot will be available shortly'));
-      return;
-    }
-    // Cold cache (first ever use): capture a live still and answer with it.
-    this.captureSnapshot(request.width, request.height, callback);
-  }
-
-  /**
-   * Refresh a stale cached still in the background, but only once the tile has
-   * been viewed continuously for a while. HomeKit polls a visible tile roughly
-   * every 10s; a user who opens the app and taps to stream produces just one or
-   * two polls before the stream, so debouncing here guarantees we never spawn a
-   * competing snapshot session in that window — which on a single-viewer camera
-   * would race the stream's hole punch. Refresh only kicks in for sustained
-   * tile-watching, when a stream is not imminent.
-   */
-  private maybeRefreshStaleSnapshot(width: number, height: number): void {
-    if (this.snapshotTtlMs <= 0 || this.active.size > 0 || this.snapshotRefreshing) return;
-    const now = Date.now();
-    if (now - this.lastSnapshotPollAt > 15_000) this.viewingStartedAt = now;
-    this.lastSnapshotPollAt = now;
-    if (now - this.lastSnapshotAt <= this.snapshotTtlMs) return;
-    if (now - this.viewingStartedAt < 25_000) return;
-    this.captureSnapshot(width, height);
-  }
-
-  /**
-   * Capture one live still into the cache (and disk), optionally answering a
-   * HomeKit snapshot request. Opens a short video-only session, so callers must
-   * only invoke it when not already streaming; concurrent captures are skipped.
-   */
-  private captureSnapshot(width: number, height: number, callback?: SnapshotRequestCallback): void {
-    if (this.snapshotRefreshing) {
-      callback?.(new Error('a snapshot capture is already in progress'), this.lastSnapshot);
-      return;
-    }
-    this.snapshotRefreshing = true;
-    this.withSession(async () => {
-      const camera = this.cameraSession(false);
-      const ffmpeg = spawn(this.ffmpegPath, [
-        '-hide_banner', '-loglevel', 'error',
-        '-f', 'h264', '-i', 'pipe:0',
-        '-frames:v', '1',
-        '-vf',
-        `scale=${width}:${height}:force_original_aspect_ratio=decrease,`
-          + `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`,
-        '-f', 'image2', 'pipe:1',
-      ]);
-      const chunks: Buffer[] = [];
-      let completed = false;
-      const finish = (error?: Error): void => {
-        if (completed) return;
-        completed = true;
-        clearTimeout(timeout);
-        camera.close();
-        ffmpeg.kill('SIGKILL');
-        this.snapshotRefreshing = false;
-        const image = chunks.length ? Buffer.concat(chunks) : undefined;
-        if (image) void this.persistSnapshot(image);
-        callback?.(error ?? (image ? undefined : new Error('snapshot produced no image')), image);
-      };
-      const timeout = setTimeout(() => finish(new Error('snapshot timeout')), 15_000);
-      ffmpeg.stdout.on('data', (data: Buffer) => chunks.push(data));
-      ffmpeg.stderr.on('data', (data: Buffer) => this.debugFfmpeg('snapshot', data));
-      observeErrors(ffmpeg.stdin, (error) => {
-        if (!completed && !isExpectedTeardownError(error)) finish(error);
-      });
-      observeErrors(ffmpeg.stdout, (error) => {
-        if (!completed && !isExpectedTeardownError(error)) finish(error);
-      });
-      observeErrors(ffmpeg.stderr, (error) => {
-        if (!completed && !isExpectedTeardownError(error)) finish(error);
-      });
-      ffmpeg.once('error', finish);
-      ffmpeg.once('close', () => finish());
-      camera.on('video', (frame: Buffer) => write(ffmpeg.stdin, frame, (error) => {
-        if (!completed && !isExpectedTeardownError(error)) finish(error);
-      }));
-      camera.once('error', (error: Error) => finish(error));
-      try {
-        await camera.open();
-      } catch (error) {
-        finish(error as Error);
-      }
-    });
+    // Passive mode: the session is already open (checked above); just read it.
   }
 
   async prepareStream(request: PrepareStreamRequest, callback: PrepareStreamCallback): Promise<void> {
@@ -493,11 +475,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     ].join('\r\n');
   }
 
-  private startReturnAudio(
-    request: StartStreamRequest,
-    camera: MyqCameraSession,
-    info: SessionInfo,
-  ): ChildProcess {
+  private startReturnAudio(request: StartStreamRequest, info: SessionInfo): ChildProcess {
     let loggedDecodedAudio = false;
     const child = spawn(this.ffmpegPath, [
       '-hide_banner', '-loglevel', this.config.debug ? 'verbose' : 'warning',
@@ -535,7 +513,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         loggedDecodedAudio = true;
         this.log.info(`Received HomeKit push-to-talk audio for ${this.cameraConfig.name}`);
       }
-      camera.writeTalkback(data);
+      this.shared.writeTalkback(data);
     });
     child.stderr.on('data', (data: Buffer) => this.debugFfmpeg('talkback', data));
     child.once('close', (code, signal) => {
@@ -563,158 +541,192 @@ export class StreamingDelegate implements CameraStreamingDelegate {
       callback(new Error('unknown HomeKit stream session'));
       return;
     }
-    this.withSession(async () => {
-      const camera = this.cameraSession(this.wantAudio);
-      let started = false;
-      let cleaned = false;
-      let callbackCompleted = false;
-      let startupTimeout: NodeJS.Timeout | undefined;
-      let resolveLock!: () => void;
-      const holdLock = new Promise<void>((resolve) => { resolveLock = resolve; });
-      const finishCallback = (error?: Error): void => {
-        if (callbackCompleted) return;
-        callbackCompleted = true;
-        callback(error);
-      };
-      const active: ActiveSession = {
-        camera,
-        cleanup: (reason = 'unknown') => {
-          if (cleaned) return;
-          const wasStarted = started;
-          cleaned = true;
-          if (startupTimeout) clearTimeout(startupTimeout);
-          if (active.timeout) clearTimeout(active.timeout);
-          try { active.returnSocket?.close(); } catch {}
-          active.ffmpeg?.kill('SIGKILL');
-          active.returnFfmpeg?.kill('SIGKILL');
-          camera.close();
-          this.active.delete(request.sessionID);
-          this.pending.delete(request.sessionID);
-          if (wasStarted) {
-            this.log.info(`Stopped HomeKit stream for ${this.cameraConfig.name} (${reason})`);
-          }
-          resolveLock();
-        },
-      };
-      this.active.set(request.sessionID, active);
-      try {
-        startupTimeout = setTimeout(() => {
-          if (started || cleaned) return;
-          const error = new Error('HomeKit stream startup timed out');
+    void this.runStream(request, info, callback);
+  }
+
+  private async runStream(
+    request: StartStreamRequest,
+    info: SessionInfo,
+    callback: StreamRequestCallback,
+  ): Promise<void> {
+    let started = false;
+    let cleaned = false;
+    let callbackCompleted = false;
+    let acquired = false;
+    let ffmpeg: ChildProcess | undefined;
+    let returnFfmpeg: ChildProcess | undefined;
+    let returnSocket: Socket | undefined;
+    let startupTimeout: NodeJS.Timeout | undefined;
+    let inactivityTimer: NodeJS.Timeout | undefined;
+    let videoInput: Writable | undefined;
+    let audioInput: Writable | undefined;
+    let gate: KeyframeGate | undefined;
+
+    const finishCallback = (error?: Error): void => {
+      if (callbackCompleted) return;
+      callbackCompleted = true;
+      callback(error);
+    };
+    const handlePipeError = (scope: string, error: NodeJS.ErrnoException): void => {
+      if (isExpectedTeardownError(error)) {
+        if (this.config.debug) {
+          this.log.debug(`[${this.cameraConfig.name}] ${scope} closed during stream teardown: ${pipeLabel(error)}`);
+        }
+        return;
+      }
+      this.log.warn(`[${this.cameraConfig.name}] ${scope} pipe failed: ${pipeLabel(error)}`);
+      cleanup('ffmpeg-pipe-error');
+    };
+    // Per-viewer keyframe gate: a viewer joining a warm/in-progress feed must
+    // start on an IDR with SPS/PPS, or FFmpeg/HomeKit sees black until headers
+    // recur. Seeded (below) with the session's known SPS/PPS.
+    const onVideo = (frame: Buffer): void => {
+      if (!gate) return;
+      for (const out of gate.feed(frame)) {
+        write(videoInput ?? null, out, (error) => handlePipeError('ffmpeg video input', error));
+      }
+    };
+    const onAudio = (frame: Buffer): void => write(audioInput ?? null, frame, (error) => handlePipeError('ffmpeg audio input', error));
+    const onSessionError = (error: Error): void => {
+      this.log.error(`myQ media error: ${error.message}`);
+      cleanup('camera-error');
+    };
+
+    const cleanup = (reason = 'unknown'): void => {
+      if (cleaned) return;
+      const wasStarted = started;
+      cleaned = true;
+      if (startupTimeout) clearTimeout(startupTimeout);
+      if (inactivityTimer) clearTimeout(inactivityTimer);
+      this.shared.removeListener('video', onVideo);
+      this.shared.removeListener('audio', onAudio);
+      this.shared.removeListener('error', onSessionError);
+      try { returnSocket?.close(); } catch {}
+      ffmpeg?.kill('SIGKILL');
+      returnFfmpeg?.kill('SIGKILL');
+      this.active.delete(request.sessionID);
+      this.pending.delete(request.sessionID);
+      if (acquired) {
+        acquired = false;
+        this.shared.release();
+      }
+      if (wasStarted) {
+        this.log.info(`Stopped HomeKit stream for ${this.cameraConfig.name} (${reason})`);
+      }
+    };
+
+    this.active.set(request.sessionID, { cleanup });
+    try {
+      startupTimeout = setTimeout(() => {
+        if (started || cleaned) return;
+        const error = new Error('HomeKit stream startup timed out');
+        this.log.warn(`HomeKit stream failed for ${this.cameraConfig.name}: ${error.message}`);
+        finishCallback(error);
+        cleanup('startup-timeout');
+      }, 45_000);
+      this.log.info(
+        `Starting HomeKit stream for ${this.cameraConfig.name} `
+        + `(${request.video.width}x${request.video.height}@${request.video.fps}fps)`,
+      );
+
+      await this.shared.acquire();
+      acquired = true;
+      if (cleaned) {
+        // cleanup() ran while acquire() was still pending (HomeKit STOP or the
+        // startup timeout), so it couldn't release the slot it didn't yet hold.
+        // Release it now that the acquire has resolved, or the shared session
+        // leaks a consumer and never idles out.
+        acquired = false;
+        this.shared.release();
+        return;
+      }
+
+      const hasHomeKitAudio = Boolean((request as { audio?: StartStreamRequest['audio'] }).audio);
+      const hasAudio = this.shared.hasAudio && hasHomeKitAudio
+        && info.audioPort !== undefined && info.audioReturnPort !== undefined
+        && info.audioSsrc !== undefined && !!info.audioSrtp;
+
+      ffmpeg = spawn(
+        this.ffmpegPath,
+        this.outputArguments(request, info, hasAudio),
+        { stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'] },
+      );
+      videoInput = ffmpeg.stdio[3] as Writable;
+      audioInput = ffmpeg.stdio[4] as Writable;
+      observeErrors(videoInput, (error) => handlePipeError('ffmpeg video input', error));
+      observeErrors(audioInput, (error) => handlePipeError('ffmpeg audio input', error));
+      observeErrors(ffmpeg.stderr, (error) => handlePipeError('ffmpeg log output', error));
+
+      gate = new KeyframeGate(this.shared.videoHeaders.sps, this.shared.videoHeaders.pps);
+      this.shared.on('video', onVideo);
+      if (hasAudio) {
+        this.shared.on('audio', onAudio);
+      } else if (this.wantAudio && this.shared.hasAudio) {
+        this.log.warn(`HomeKit did not prepare audio for ${this.cameraConfig.name}; streaming video-only`);
+      }
+      this.shared.on('error', onSessionError);
+
+      ffmpeg.stderr?.on('data', (data: Buffer) => this.debugFfmpeg('stream', data));
+      ffmpeg.once('error', (error: NodeJS.ErrnoException) => {
+        if (!started) {
+          this.log.warn(`[${this.cameraConfig.name}] ffmpeg stream process failed before startup: ${pipeLabel(error)}`);
+          finishCallback(error);
+        } else if (!isExpectedTeardownError(error)) {
+          this.log.warn(`[${this.cameraConfig.name}] ffmpeg stream process failed: ${pipeLabel(error)}`);
+        }
+        cleanup('ffmpeg-error');
+      });
+      ffmpeg.once('close', (code, signal) => {
+        if (!started && !callbackCompleted) {
+          const error = new Error(
+            `ffmpeg stream exited before startup (code=${code ?? 'null'}, signal=${signal ?? 'null'})`,
+          );
           this.log.warn(`HomeKit stream failed for ${this.cameraConfig.name}: ${error.message}`);
           finishCallback(error);
-          active.cleanup('startup-timeout');
-        }, 45_000);
+        }
+        cleanup('ffmpeg-exit');
+      });
+
+      returnSocket = createSocket(info.ipv6 ? 'udp6' : 'udp4');
+      returnSocket.on('error', (error) => {
+        this.log.error(`HomeKit RTCP socket failed: ${error.message}`);
+        cleanup('rtcp-error');
+      });
+      returnSocket.on('message', () => {
+        if (inactivityTimer) clearTimeout(inactivityTimer);
+        inactivityTimer = setTimeout(() => {
+          this.log.info(`HomeKit client inactive; stopping ${this.cameraConfig.name}`);
+          this.controller.forceStopStreamingSession(request.sessionID);
+          cleanup('homekit-inactive');
+        }, Math.max(5, request.video.rtcp_interval * 5) * 1000);
+      });
+      returnSocket.bind(info.videoReturnPort);
+
+      if (this.wantTalkback && hasAudio) {
         this.log.info(
-          `Starting HomeKit stream for ${this.cameraConfig.name} `
-          + `(${request.video.width}x${request.video.height}@${request.video.fps}fps)`,
+          `HomeKit push-to-talk ready for ${this.cameraConfig.name} `
+          + `(${request.audio.codec}/${request.audio.sample_rate}kHz, `
+          + `ptime=${request.audio.packet_time}ms, pt=${request.audio.pt})`,
         );
-        await camera.open();
-        if (cleaned) return;
-        const hasHomeKitAudio = Boolean((request as { audio?: StartStreamRequest['audio'] }).audio);
-        const hasAudio = camera.hasAudio && hasHomeKitAudio
-          && info.audioPort !== undefined && info.audioReturnPort !== undefined
-          && info.audioSsrc !== undefined && !!info.audioSrtp;
-        const ffmpeg = spawn(
-          this.ffmpegPath,
-          this.outputArguments(request, info, hasAudio),
-          { stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'] },
-        );
-        active.ffmpeg = ffmpeg;
-        const videoInput = ffmpeg.stdio[3] as Writable;
-        const audioInput = ffmpeg.stdio[4] as Writable;
-        const handlePipeError = (scope: string, error: NodeJS.ErrnoException): void => {
-          if (isExpectedTeardownError(error)) {
-            if (this.config.debug) {
-              this.log.debug(`[${this.cameraConfig.name}] ${scope} closed during stream teardown: ${pipeLabel(error)}`);
-            }
-            return;
-          }
-          this.log.warn(`[${this.cameraConfig.name}] ${scope} pipe failed: ${pipeLabel(error)}`);
-          active.cleanup('ffmpeg-pipe-error');
-        };
-        observeErrors(videoInput, (error) => handlePipeError('ffmpeg video input', error));
-        observeErrors(audioInput, (error) => handlePipeError('ffmpeg audio input', error));
-        observeErrors(ffmpeg.stderr, (error) => handlePipeError('ffmpeg log output', error));
-        camera.on('video', (frame: Buffer) => write(
-          videoInput,
-          frame,
-          (error) => handlePipeError('ffmpeg video input', error),
-        ));
-        if (hasAudio) {
-          camera.on('audio', (frame: Buffer) => write(
-            audioInput,
-            frame,
-            (error) => handlePipeError('ffmpeg audio input', error),
-          ));
-        } else if (this.wantAudio && camera.hasAudio) {
-          this.log.warn(`HomeKit did not prepare audio for ${this.cameraConfig.name}; streaming video-only`);
-        }
-        camera.on('error', (error: Error) => {
-          this.log.error(`myQ media error: ${error.message}`);
-          active.cleanup('camera-error');
-        });
-        ffmpeg.stderr?.on('data', (data: Buffer) => this.debugFfmpeg('stream', data));
-        ffmpeg.once('error', (error: NodeJS.ErrnoException) => {
-          if (!started) {
-            this.log.warn(`[${this.cameraConfig.name}] ffmpeg stream process failed before startup: ${pipeLabel(error)}`);
-            finishCallback(error);
-          }
-          else if (!isExpectedTeardownError(error)) {
-            this.log.warn(`[${this.cameraConfig.name}] ffmpeg stream process failed: ${pipeLabel(error)}`);
-          }
-          active.cleanup('ffmpeg-error');
-        });
-        ffmpeg.once('close', (code, signal) => {
-          if (!started && !callbackCompleted) {
-            const error = new Error(
-              `ffmpeg stream exited before startup (code=${code ?? 'null'}, signal=${signal ?? 'null'})`,
-            );
-            this.log.warn(`HomeKit stream failed for ${this.cameraConfig.name}: ${error.message}`);
-            finishCallback(error);
-          }
-          active.cleanup('ffmpeg-exit');
-        });
-
-        const returnSocket = createSocket(info.ipv6 ? 'udp6' : 'udp4');
-        active.returnSocket = returnSocket;
-        returnSocket.on('error', (error) => {
-          this.log.error(`HomeKit RTCP socket failed: ${error.message}`);
-          active.cleanup('rtcp-error');
-        });
-        returnSocket.on('message', () => {
-          if (active.timeout) clearTimeout(active.timeout);
-          active.timeout = setTimeout(() => {
-            this.log.info(`HomeKit client inactive; stopping ${this.cameraConfig.name}`);
-            this.controller.forceStopStreamingSession(request.sessionID);
-            active.cleanup('homekit-inactive');
-          }, Math.max(5, request.video.rtcp_interval * 5) * 1000);
-        });
-        returnSocket.bind(info.videoReturnPort);
-
-        if (this.wantTalkback && hasAudio) {
-          this.log.info(
-            `HomeKit push-to-talk ready for ${this.cameraConfig.name} `
-            + `(${request.audio.codec}/${request.audio.sample_rate}kHz, `
-            + `ptime=${request.audio.packet_time}ms, pt=${request.audio.pt})`,
-          );
-          active.returnFfmpeg = this.startReturnAudio(request, camera, info);
-        }
-        started = true;
-        if (startupTimeout) clearTimeout(startupTimeout);
-        finishCallback();
-        this.log.info(`Started HomeKit stream for ${this.cameraConfig.name}`);
-        this.refreshSnapshotFromStream(camera);
-      } catch (error) {
-        this.log.warn(`HomeKit stream failed for ${this.cameraConfig.name}: ${describeError(error)}`);
-        if (this.config.debug && error instanceof Error && error.stack) {
-          this.log.debug(`[${this.cameraConfig.name}] stream startup stack: ${error.stack}`);
-        }
-        if (!started) finishCallback(error as Error);
-        active.cleanup(started ? 'stream-error' : 'startup-failure');
+        returnFfmpeg = this.startReturnAudio(request, info);
       }
-      await holdLock;
-    });
+      started = true;
+      if (startupTimeout) clearTimeout(startupTimeout);
+      finishCallback();
+      this.log.info(`Started HomeKit stream for ${this.cameraConfig.name}`);
+      // Refresh the cached still off the now-open session so the tile is current
+      // after a live view — the "refresh while streaming" path, independent of
+      // whether HomeKit polls a snapshot during the stream. Passive: the stream
+      // already holds the session.
+      this.refreshSnapshot(1280, 720, false);
+    } catch (error) {
+      this.log.warn(`HomeKit stream failed for ${this.cameraConfig.name}: ${describeError(error)}`);
+      if (this.config.debug && error instanceof Error && error.stack) {
+        this.log.debug(`[${this.cameraConfig.name}] stream startup stack: ${error.stack}`);
+      }
+      if (!started) finishCallback(error as Error);
+      cleanup(started ? 'stream-error' : 'startup-failure');
+    }
   }
 
   handleStreamRequest(request: StreamingRequest, callback: StreamRequestCallback): void {
@@ -743,6 +755,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     this.active.forEach((session) => session.cleanup('shutdown'));
     this.active.clear();
     this.pending.clear();
+    this.shared.shutdown();
   }
 }
 

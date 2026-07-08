@@ -5,6 +5,35 @@ All notable changes to `homebridge-myq-camera` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-08
+
+### Changed
+- **Snapshots and live streams now share one camera session.** The TC camera
+  serves a single viewer, so instead of snapshots and streams opening competing
+  sessions (the source of the earlier hole-punch collisions), they all multiplex
+  a single reference-counted `SharedCameraSession`. This removes the snapshot→
+  stream collision entirely, so the staleness debounce/TTL heuristic is gone —
+  snapshots are served instantly from cache and refreshed straight off the live
+  feed. A warm session also means a follow-up snapshot or stream starts instantly
+  (no re-punch).
+
+### Added
+- **Multiple concurrent HomeKit viewers.** Because every viewer shares the one
+  session, the camera's single-viewer limit no longer caps us. New `maxViewers`
+  option (default `0` = unlimited; HomeKit needs a concrete count, so mapped to 8).
+  Each viewer/snapshot gets its own keyframe gate seeded with the session's
+  SPS/PPS, so a viewer joining a stream in progress starts on a clean IDR instead
+  of black video.
+- `keepAliveSeconds` (default `60`): how long the shared session stays warm after
+  the last snapshot/stream finishes, so a follow-up request reuses it instantly.
+- Snapshots refresh off the live feed while the session is open (streaming **or**
+  in the warm window) as a passive read that doesn't extend the keep-alive, and a
+  final still is captured right before the warm session idles out so the tile is
+  current afterward.
+- `snapshotRefreshInterval` (default `15`s) now controls when a snapshot request
+  opens a *closed* session to refresh a stale still; `0` = only refresh while a
+  session is already open.
+
 ## [0.2.13] - 2026-07-07
 
 ### Fixed
@@ -121,6 +150,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Device-free OAuth refresh-token rotation, native CXS signaling, and SDNK LAN
   hole-punching — no phone, Python, or external media server required.
 
+[0.3.0]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.13...v0.3.0
 [0.2.13]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.12...v0.2.13
 [0.2.12]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.11...v0.2.12
 [0.2.11]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.10...v0.2.11

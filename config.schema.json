@@ -48,12 +48,26 @@
         "type": "boolean",
         "default": false
       },
+      "keepAliveSeconds": {
+        "title": "Session keep-alive (seconds)",
+        "type": "integer",
+        "default": 60,
+        "minimum": 10,
+        "description": "How long the shared camera session stays warm after the last snapshot/stream finishes, so a follow-up request reuses it instantly. Snapshots and live streams share this one session, which is why they no longer collide and multiple viewers can watch at once."
+      },
+      "maxViewers": {
+        "title": "Max concurrent viewers",
+        "type": "integer",
+        "default": 0,
+        "minimum": 0,
+        "description": "How many HomeKit clients may stream at once (they all share one camera session). 0 = unlimited (capped at 8, since HomeKit needs a concrete number)."
+      },
       "snapshotRefreshInterval": {
         "title": "Snapshot refresh interval (seconds)",
         "type": "integer",
-        "default": 120,
+        "default": 15,
         "minimum": 0,
-        "description": "How stale a cached snapshot may be before it is refreshed in the background (the tile keeps showing the cached image until the fresh one is ready). Lower = fresher tiles but more brief camera sessions. Set to 0 to only refresh snapshots while streaming."
+        "description": "While the shared session is open (streaming or in the warm keep-alive window), snapshot requests refresh the cached still off the live feed without holding the session open. When the session is closed, a request opens one to refresh a still older than this many seconds (then keeps it warm). 0 = only refresh while a session is already open."
       },
       "cameras": {
         "title": "Cameras",
