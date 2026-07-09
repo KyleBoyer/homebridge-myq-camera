@@ -166,8 +166,10 @@ export class StreamingDelegate implements CameraStreamingDelegate {
       .replace(/[^\w.-]+/g, '_');
     this.snapshotFile = join(api.user.storagePath(), 'myq-camera', `snapshot-${slug}.jpg`);
     // How stale a cached still may be before a snapshot request refreshes it
-    // from the shared session (opening it if closed). 0 = never open the
-    // session just for a snapshot — only refresh while a stream is running.
+    // from the shared session (opening it if closed). 0 = always refresh on
+    // snapshot request. This is safe with the singleton session: a follow-up
+    // live view reuses the same warm camera session instead of colliding with
+    // a separate snapshot session.
     const interval = config.snapshotRefreshInterval;
     this.snapshotRefreshMs = interval === 0 ? 0 : Math.max(5, interval ?? 15) * 1000;
     try {
@@ -259,16 +261,17 @@ export class StreamingDelegate implements CameraStreamingDelegate {
       return;
     }
 
-    // Closed session + stale cache: block for a fresh still (bounded by the
-    // snapshot guard) instead of returning a "not responding" looking old tile.
-    // Opening the shared session here also warms a likely follow-up live view.
-    if (this.snapshotRefreshMs > 0 && Date.now() - this.lastSnapshotAt >= this.snapshotRefreshMs) {
+    // Closed session + refreshable cache: block for a fresh still (bounded by
+    // the snapshot guard) instead of returning a "not responding" looking old
+    // tile. Opening the shared session here also warms a likely follow-up live
+    // view. snapshotRefreshInterval=0 means refresh on every snapshot request.
+    if (this.snapshotRefreshMs === 0 || Date.now() - this.lastSnapshotAt >= this.snapshotRefreshMs) {
       this.refreshSnapshot(request.width, request.height, true, callback);
       return;
     }
 
-    // Closed session + fresh-enough cache, or snapshotRefreshInterval=0: serve
-    // the persisted still immediately without opening the camera.
+    // Closed session + fresh-enough cache: serve the persisted still immediately
+    // without opening the camera.
     callback(undefined, this.lastSnapshot);
   }
 

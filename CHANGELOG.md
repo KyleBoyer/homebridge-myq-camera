@@ -5,6 +5,18 @@ All notable changes to `homebridge-myq-camera` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-07-09
+
+### Changed
+- `snapshotRefreshInterval: 0` now means "refresh on every snapshot request."
+  With the singleton shared camera session, a cold snapshot request can safely
+  open/warm the stream because a follow-up live view reuses that same session
+  instead of colliding with a separate snapshot session.
+- Nonzero `snapshotRefreshInterval` values keep their threshold behavior: a
+  closed-session snapshot request refreshes once the cached still is older than
+  the configured number of seconds, while open/warm sessions always refresh from
+  the latest warm keyframe.
+
 ## [0.3.1] - 2026-07-08
 
 ### Changed
@@ -165,6 +177,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Device-free OAuth refresh-token rotation, native CXS signaling, and SDNK LAN
   hole-punching — no phone, Python, or external media server required.
 
+[0.3.2]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.13...v0.3.0
 [0.2.13]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.12...v0.2.13

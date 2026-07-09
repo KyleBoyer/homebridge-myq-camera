@@ -160,9 +160,8 @@ the current feed. Snapshots are persisted to the storage directory so a restart 
 blank; when the shared session is open, or when a closed-session snapshot is older than
 `snapshotRefreshInterval` seconds (default 15), HomeKit waits for a fresh still rather
 than getting the previous poll's cached image. Set `snapshotRefreshInterval` to `0` to
-avoid opening a closed session just to refresh an existing still. `maxViewers` caps
-concurrent streams (default `0` = unlimited, mapped to 8 since HomeKit needs a concrete
-count).
+refresh on every snapshot request. `maxViewers` caps concurrent streams (default `0` =
+unlimited, mapped to 8 since HomeKit needs a concrete count).
 
 Push-to-talk return audio is decrypted from HomeKit SRTP by FFmpeg, converted once to
 8 kHz μ-law, and injected into the existing Seedonk audio channel. Camera audio travels
