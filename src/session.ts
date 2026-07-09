@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { TokenManager } from './auth';
 import { TendClient } from './cxs';
-import { KeyframeGate, PPS_NAL, SPS_NAL, nals } from './h264';
+import { IDR_NAL, KeyframeGate, PPS_NAL, SPS_NAL, nals } from './h264';
 import { P2PMediaSession } from './p2p';
 import type { Camera, ConnectionInfo, PluginLogger } from './types';
 
@@ -107,6 +107,7 @@ export class SharedCameraSession extends EventEmitter {
   private closed = false;
   private sps?: Buffer;
   private pps?: Buffer;
+  private keyframe?: Buffer;
 
   /**
    * Optional hook run once, on the still-open session, right before the warm
@@ -137,6 +138,11 @@ export class SharedCameraSession extends EventEmitter {
   /** Latest SPS/PPS seen on the feed, to seed a late viewer's keyframe gate. */
   get videoHeaders(): { sps?: Buffer; pps?: Buffer } {
     return { sps: this.sps, pps: this.pps };
+  }
+
+  /** Latest decodable IDR access unit, prefixed with SPS/PPS if needed. */
+  get videoKeyframe(): Buffer | undefined {
+    return this.keyframe;
   }
 
   /** Open the session if needed and register a consumer. Balance with release(). */
@@ -207,9 +213,16 @@ export class SharedCameraSession extends EventEmitter {
   }
 
   private readonly onVideo = (frame: Buffer): void => {
-    for (const unit of nals(frame)) {
+    let idr = false;
+    const units = nals(frame);
+    for (const unit of units) {
       if (unit.type === SPS_NAL) this.sps = unit.data;
       else if (unit.type === PPS_NAL) this.pps = unit.data;
+      else if (unit.type === IDR_NAL) idr = true;
+    }
+    if (idr && this.sps && this.pps) {
+      const alreadyPrefixed = units[0] && [SPS_NAL, PPS_NAL].includes(units[0].type);
+      this.keyframe = alreadyPrefixed ? frame : Buffer.concat([this.sps, this.pps, frame]);
     }
     this.emit('video', frame);
   };
@@ -264,6 +277,7 @@ export class SharedCameraSession extends EventEmitter {
     this.consumers = 0;
     this.sps = undefined;
     this.pps = undefined;
+    this.keyframe = undefined;
     if (session) {
       session.removeListener('video', this.onVideo);
       session.removeListener('audio', this.onAudio);

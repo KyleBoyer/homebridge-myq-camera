@@ -242,28 +242,34 @@ export class StreamingDelegate implements CameraStreamingDelegate {
   }
 
   handleSnapshotRequest(request: SnapshotRequest, callback: SnapshotRequestCallback): void {
-    // Serve the cached still instantly, then refresh it from the shared session
-    // in the background (opening the session if needed and keeping it warm) so
-    // the next poll is current. A live stream keeps the session open, so during
-    // viewing snapshots are always fresh and never open a competing session.
-    if (this.lastSnapshot) {
-      callback(undefined, this.lastSnapshot);
-      if (this.shared.open) {
-        // Session already open (streaming or in the warm keep-alive window) —
-        // refresh the tile passively off the live feed, without opening a new
-        // session or extending the keep-alive timer.
-        this.refreshSnapshot(request.width, request.height, false);
-      } else if (this.snapshotRefreshMs > 0
-        && Date.now() - this.lastSnapshotAt >= this.snapshotRefreshMs) {
-        // Cache is stale and the session is closed — open one to refresh it and
-        // keep it warm. snapshotRefreshInterval=0 disables this, so snapshots
-        // only refresh while a session is already open.
-        this.refreshSnapshot(request.width, request.height, true);
-      }
+    // Prefer returning a fresh still when the camera session is already open:
+    // HomeKit tile polls after a live view otherwise show the previous poll's
+    // image (roughly 10s old on iOS). This passive capture does not extend the
+    // warm keep-alive window.
+    if (this.shared.open) {
+      this.refreshSnapshot(request.width, request.height, false, callback);
       return;
     }
+
     // Cold cache (first ever use): open a session, capture a still, answer.
-    this.refreshSnapshot(request.width, request.height, true, callback);
+    // This is intentionally allowed even when snapshotRefreshInterval=0 so the
+    // accessory can bootstrap from blank to usable.
+    if (!this.lastSnapshot) {
+      this.refreshSnapshot(request.width, request.height, true, callback);
+      return;
+    }
+
+    // Closed session + stale cache: block for a fresh still (bounded by the
+    // snapshot guard) instead of returning a "not responding" looking old tile.
+    // Opening the shared session here also warms a likely follow-up live view.
+    if (this.snapshotRefreshMs > 0 && Date.now() - this.lastSnapshotAt >= this.snapshotRefreshMs) {
+      this.refreshSnapshot(request.width, request.height, true, callback);
+      return;
+    }
+
+    // Closed session + fresh-enough cache, or snapshotRefreshInterval=0: serve
+    // the persisted still immediately without opening the camera.
+    callback(undefined, this.lastSnapshot);
   }
 
   /**
@@ -304,6 +310,11 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     const onVideo = (frame: Buffer): void => {
       for (const out of gate.feed(frame)) write(ffmpeg.stdin, out, () => {});
     };
+    const feedCachedKeyframe = (): void => {
+      const keyframe = this.shared.videoKeyframe;
+      if (!keyframe) return;
+      for (const out of gate.feed(keyframe)) write(ffmpeg.stdin, out, () => {});
+    };
     const onError = (error: Error): void => finish(error);
     let done = false;
     let acquired = false;
@@ -332,6 +343,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     // waiting out the 15s timeout (and so SharedCameraSession actually emits).
     this.shared.on('error', onError);
     this.shared.on('video', onVideo);
+    feedCachedKeyframe();
     if (acquireSession) {
       this.shared.acquire().then(() => {
         if (done) {
@@ -340,6 +352,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
           return;
         }
         acquired = true;
+        feedCachedKeyframe();
       }).catch((error) => finish(error as Error));
     }
     // Passive mode: the session is already open (checked above); just read it.
@@ -606,6 +619,13 @@ export class StreamingDelegate implements CameraStreamingDelegate {
       returnFfmpeg?.kill('SIGKILL');
       this.active.delete(request.sessionID);
       this.pending.delete(request.sessionID);
+      if (wasStarted && reason !== 'shutdown' && this.shared.open) {
+        // HomeKit often shows the just-ended live frame for a moment, then asks
+        // us for a tile snapshot. Capture a fresh still immediately while the
+        // shared feed is still warm, rather than waiting until keepAlive idle
+        // close to grab the final still.
+        this.refreshSnapshot(1280, 720, false);
+      }
       if (acquired) {
         acquired = false;
         this.shared.release();

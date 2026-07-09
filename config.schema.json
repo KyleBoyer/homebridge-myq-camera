@@ -67,7 +67,7 @@
         "type": "integer",
         "default": 15,
         "minimum": 0,
-        "description": "While the shared session is open (streaming or in the warm keep-alive window), snapshot requests refresh the cached still off the live feed without holding the session open. When the session is closed, a request opens one to refresh a still older than this many seconds (then keeps it warm). 0 = only refresh while a session is already open."
+        "description": "While the shared session is open (streaming or in the warm keep-alive window), snapshot requests wait for a fresh still decoded from the latest warm keyframe without holding the session open. When the session is closed, a request opens one to refresh a still older than this many seconds (then keeps it warm). 0 = only refresh while a session is already open."
       },
       "cameras": {
         "title": "Cameras",

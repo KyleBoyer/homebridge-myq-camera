@@ -5,6 +5,21 @@ All notable changes to `homebridge-myq-camera` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-07-08
+
+### Changed
+- While the shared session is warm, the plugin now caches the latest decodable
+  H.264 keyframe bundle (`SPS`/`PPS`/`IDR`) so snapshot capture can start from a
+  current keyframe immediately instead of waiting for the next IDR.
+- Snapshot requests now block for a fresh still whenever the shared camera
+  session is already open or the closed-session snapshot cache is stale. This
+  trades a short wait for a current tile, prevents post-live-view snapshots from
+  lagging one HomeKit poll behind, and warms the camera for a likely follow-up
+  live view.
+- When a HomeKit live stream stops, the plugin now starts a best-effort snapshot
+  capture immediately while the shared feed is still warm, instead of waiting
+  until the keep-alive idle timer is about to close the session.
+
 ## [0.3.0] - 2026-07-08
 
 ### Changed
@@ -150,6 +165,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Device-free OAuth refresh-token rotation, native CXS signaling, and SDNK LAN
   hole-punching — no phone, Python, or external media server required.
 
+[0.3.1]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.13...v0.3.0
 [0.2.13]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.12...v0.2.13
 [0.2.12]: https://github.com/KyleBoyer/homebridge-myq-camera/compare/v0.2.11...v0.2.12

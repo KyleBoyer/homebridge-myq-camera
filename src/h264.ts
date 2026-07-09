@@ -29,6 +29,7 @@ export function nals(data: Buffer): Array<{ type: number; data: Buffer }> {
 
 export const SPS_NAL = NAL_SPS;
 export const PPS_NAL = NAL_PPS;
+export const IDR_NAL = NAL_IDR;
 
 export class KeyframeGate {
   private open = false;

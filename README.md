@@ -154,11 +154,15 @@ iPad) even though the camera only serves one viewer directly.
 
 The session is opened on demand (a snapshot or stream request) and kept warm for
 `keepAliveSeconds` (default 60) after the last one finishes, so a follow-up request reuses
-it instantly instead of re-punching. Snapshots are served from a cached still immediately
-(persisted to the storage directory so a restart is never blank) and refreshed from the
-shared feed when older than `snapshotRefreshInterval` seconds (default 15; `0` = only
-refresh while a stream is running). `maxViewers` caps concurrent streams (default `0` =
-unlimited, mapped to 8 since HomeKit needs a concrete count).
+it instantly instead of re-punching. While warm, the plugin keeps the latest decodable
+H.264 keyframe bundle (`SPS`/`PPS`/`IDR`) so snapshot capture can start immediately from
+the current feed. Snapshots are persisted to the storage directory so a restart is never
+blank; when the shared session is open, or when a closed-session snapshot is older than
+`snapshotRefreshInterval` seconds (default 15), HomeKit waits for a fresh still rather
+than getting the previous poll's cached image. Set `snapshotRefreshInterval` to `0` to
+avoid opening a closed session just to refresh an existing still. `maxViewers` caps
+concurrent streams (default `0` = unlimited, mapped to 8 since HomeKit needs a concrete
+count).
 
 Push-to-talk return audio is decrypted from HomeKit SRTP by FFmpeg, converted once to
 8 kHz μ-law, and injected into the existing Seedonk audio channel. Camera audio travels
