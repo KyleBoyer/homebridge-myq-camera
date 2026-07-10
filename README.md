@@ -163,6 +163,13 @@ than getting the previous poll's cached image. Set `snapshotRefreshInterval` to 
 refresh on every snapshot request. `maxViewers` caps concurrent streams (default `0` =
 unlimited, mapped to 8 since HomeKit needs a concrete count).
 
+Advanced timing knobs are available when a camera or relay is slow to release:
+`snapshotTimeoutSeconds` (default 15), `streamStartupTimeoutSeconds` (default 45),
+`videoPunchTimeoutSeconds` (default 8 per attempt), `videoPunchAttempts` (default 2),
+`videoPunchRetryDelaySeconds` (default 4), and `interSessionCooldownSeconds` (default 3).
+The defaults are intentionally conservative; only raise them if logs show the camera is
+still completing a later retry after HomeKit gives up.
+
 Push-to-talk return audio is decrypted from HomeKit SRTP by FFmpeg, converted once to
 8 kHz μ-law, and injected into the existing Seedonk audio channel. Camera audio travels
 the opposite direction without an intermediate lossy AAC hop.

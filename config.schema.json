@@ -69,6 +69,49 @@
         "minimum": 0,
         "description": "While the shared session is open (streaming or in the warm keep-alive window), snapshot requests wait for a fresh still decoded from the latest warm keyframe without holding the session open. When the session is closed, a request opens one to refresh a still older than this many seconds (then keeps it warm). 0 = refresh on every snapshot request."
       },
+      "snapshotTimeoutSeconds": {
+        "title": "Snapshot timeout (seconds)",
+        "type": "integer",
+        "default": 15,
+        "minimum": 3,
+        "description": "Maximum time a fresh HomeKit snapshot request may wait for the shared camera session and one decodable frame before returning an error or the last cached still."
+      },
+      "streamStartupTimeoutSeconds": {
+        "title": "Stream startup timeout (seconds)",
+        "type": "integer",
+        "default": 45,
+        "minimum": 10,
+        "description": "Maximum time HomeKit stream startup may wait for the shared camera session, hole-punch retries, and FFmpeg startup."
+      },
+      "videoPunchTimeoutSeconds": {
+        "title": "Video hole-punch timeout (seconds)",
+        "type": "integer",
+        "default": 8,
+        "minimum": 1,
+        "description": "Per-attempt timeout for the native Seedonk video hole punch."
+      },
+      "videoPunchAttempts": {
+        "title": "Video hole-punch attempts",
+        "type": "integer",
+        "default": 2,
+        "minimum": 1,
+        "maximum": 8,
+        "description": "How many native Seedonk video hole-punch attempts to try before failing a camera session open."
+      },
+      "videoPunchRetryDelaySeconds": {
+        "title": "Video hole-punch retry delay (seconds)",
+        "type": "integer",
+        "default": 4,
+        "minimum": 0,
+        "description": "Delay between failed video hole-punch attempts."
+      },
+      "interSessionCooldownSeconds": {
+        "title": "Inter-session cooldown (seconds)",
+        "type": "integer",
+        "default": 3,
+        "minimum": 0,
+        "description": "Minimum gap after closing a native myQ media session before opening the next one, giving the camera time to release its single-viewer slot."
+      },
       "cameras": {
         "title": "Cameras",
         "type": "array",

@@ -77,6 +77,18 @@ function describeError(error: unknown): string {
   return String(error);
 }
 
+function secondsToMs(value: number | undefined, fallback: number, min: number): number {
+  return Math.max(min, value ?? fallback) * 1000;
+}
+
+function integerOption(value: number | undefined, fallback: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, Math.trunc(value ?? fallback)));
+}
+
+function secondsLabel(ms: number): string {
+  return `${(ms / 1000).toFixed(ms % 1000 === 0 ? 0 : 1)}s`;
+}
+
 function observeErrors(
   emitter: ErrorEmitter | null | undefined,
   onError: (error: NodeJS.ErrnoException) => void,
@@ -124,6 +136,8 @@ export class StreamingDelegate implements CameraStreamingDelegate {
   private lastSnapshotAt = 0;
   private readonly snapshotFile: string;
   private readonly snapshotRefreshMs: number;
+  private readonly snapshotTimeoutMs: number;
+  private readonly streamStartupTimeoutMs: number;
   private snapshotRefreshing = false;
 
   private readonly wantAudio: boolean;
@@ -147,10 +161,20 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     // with audio when wanted so a follow-up stream gets audio from a warm
     // session without reopening.
     const keepAliveMs = Math.max(10, config.keepAliveSeconds ?? 60) * 1000;
+    const videoPunchTimeoutMs = secondsToMs(config.videoPunchTimeoutSeconds, 8, 1);
+    const videoPunchAttempts = integerOption(config.videoPunchAttempts, 2, 1, 8);
+    const videoPunchRetryDelayMs = secondsToMs(config.videoPunchRetryDelaySeconds, 4, 0);
+    const releaseCooldownMs = secondsToMs(config.interSessionCooldownSeconds, 3, 0);
+    this.snapshotTimeoutMs = secondsToMs(config.snapshotTimeoutSeconds, 15, 3);
+    this.streamStartupTimeoutMs = secondsToMs(config.streamStartupTimeoutSeconds, 45, 10);
     this.shared = new SharedCameraSession(
       () => new MyqCameraSession(connection, this.log, {
         camera: this.cameraConfig.deviceId,
         audio: this.wantAudio,
+        videoPunchTimeoutMs,
+        videoPunchAttempts,
+        videoPunchRetryDelayMs,
+        releaseCooldownMs,
       }),
       this.log,
       keepAliveMs,
@@ -243,12 +267,21 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     }
   }
 
+  private snapshotAge(): string {
+    if (!this.lastSnapshot) return 'none';
+    return secondsLabel(Date.now() - this.lastSnapshotAt);
+  }
+
   handleSnapshotRequest(request: SnapshotRequest, callback: SnapshotRequestCallback): void {
     // Prefer returning a fresh still when the camera session is already open:
     // HomeKit tile polls after a live view otherwise show the previous poll's
     // image (roughly 10s old on iOS). This passive capture does not extend the
     // warm keep-alive window.
     if (this.shared.open) {
+      this.log.info(
+        `Snapshot request for ${this.cameraConfig.name} (${request.width}x${request.height}): `
+        + `refreshing from warm session (cacheAge=${this.snapshotAge()})`,
+      );
       this.refreshSnapshot(request.width, request.height, false, callback);
       return;
     }
@@ -257,6 +290,10 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     // This is intentionally allowed even when snapshotRefreshInterval=0 so the
     // accessory can bootstrap from blank to usable.
     if (!this.lastSnapshot) {
+      this.log.info(
+        `Snapshot request for ${this.cameraConfig.name} (${request.width}x${request.height}): `
+        + 'no cache — opening shared session',
+      );
       this.refreshSnapshot(request.width, request.height, true, callback);
       return;
     }
@@ -266,12 +303,23 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     // tile. Opening the shared session here also warms a likely follow-up live
     // view. snapshotRefreshInterval=0 means refresh on every snapshot request.
     if (this.snapshotRefreshMs === 0 || Date.now() - this.lastSnapshotAt >= this.snapshotRefreshMs) {
+      const reason = this.snapshotRefreshMs === 0
+        ? 'interval=0'
+        : `cacheAge=${this.snapshotAge()} >= interval=${secondsLabel(this.snapshotRefreshMs)}`;
+      this.log.info(
+        `Snapshot request for ${this.cameraConfig.name} (${request.width}x${request.height}): `
+        + `opening shared session (${reason})`,
+      );
       this.refreshSnapshot(request.width, request.height, true, callback);
       return;
     }
 
     // Closed session + fresh-enough cache: serve the persisted still immediately
     // without opening the camera.
+    this.log.info(
+      `Snapshot request for ${this.cameraConfig.name} (${request.width}x${request.height}): `
+      + `serving cached still (cacheAge=${this.snapshotAge()}, interval=${secondsLabel(this.snapshotRefreshMs)})`,
+    );
     callback(undefined, this.lastSnapshot);
   }
 
@@ -287,6 +335,10 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     callback?: SnapshotRequestCallback,
   ): void {
     if (this.snapshotRefreshing) {
+      this.log.info(
+        `Snapshot refresh for ${this.cameraConfig.name} already in progress; `
+        + `returning ${this.lastSnapshot ? 'cached still' : 'error'}`,
+      );
       callback?.(this.lastSnapshot ? undefined : new Error('a snapshot capture is in progress'), this.lastSnapshot);
       return;
     }
@@ -294,10 +346,16 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     // opens one nor resets the keep-alive timer, so tile polls during the warm
     // window stay fresh without holding the session open indefinitely.
     if (!acquireSession && !this.shared.open) {
+      this.log.info(`Snapshot refresh for ${this.cameraConfig.name} skipped; shared session is no longer open`);
       callback?.(this.lastSnapshot ? undefined : new Error('camera session not open'), this.lastSnapshot);
       return;
     }
     this.snapshotRefreshing = true;
+    const startedAt = Date.now();
+    this.log.info(
+      `Snapshot refresh starting for ${this.cameraConfig.name} `
+      + `(${acquireSession ? 'open-or-reuse' : 'warm-read'}, timeout=${secondsLabel(this.snapshotTimeoutMs)})`,
+    );
     // Gate so the still decodes from a clean SPS/PPS/IDR even mid-stream.
     const gate = new KeyframeGate(this.shared.videoHeaders.sps, this.shared.videoHeaders.pps);
     const ffmpeg = spawn(this.ffmpegPath, [
@@ -332,9 +390,17 @@ export class StreamingDelegate implements CameraStreamingDelegate {
       if (acquired) this.shared.release();
       const image = chunks.length ? Buffer.concat(chunks) : undefined;
       if (image) void this.persistSnapshot(image);
+      const elapsed = secondsLabel(Date.now() - startedAt);
+      if (error) {
+        this.log.warn(`Snapshot refresh failed for ${this.cameraConfig.name} after ${elapsed}: ${describeError(error)}`);
+      } else if (image) {
+        this.log.info(`Snapshot refresh completed for ${this.cameraConfig.name} after ${elapsed} (${image.length} bytes)`);
+      } else {
+        this.log.warn(`Snapshot refresh produced no image for ${this.cameraConfig.name} after ${elapsed}`);
+      }
       callback?.(error ?? (image ? undefined : new Error('snapshot produced no image')), image ?? this.lastSnapshot);
     };
-    const guard = setTimeout(() => finish(new Error('snapshot timeout')), 15_000);
+    const guard = setTimeout(() => finish(new Error('snapshot timeout')), this.snapshotTimeoutMs);
     ffmpeg.stdout.on('data', (data: Buffer) => chunks.push(data));
     ffmpeg.stderr.on('data', (data: Buffer) => this.debugFfmpeg('snapshot', data));
     observeErrors(ffmpeg.stdin, (error) => { if (!done && !isExpectedTeardownError(error)) finish(error); });
@@ -348,13 +414,16 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     this.shared.on('video', onVideo);
     feedCachedKeyframe();
     if (acquireSession) {
+      this.log.info(`Snapshot refresh for ${this.cameraConfig.name} acquiring shared camera session`);
       this.shared.acquire().then(() => {
         if (done) {
           // Finished (e.g. timed out) before the open completed — release now.
+          this.log.info(`Snapshot refresh for ${this.cameraConfig.name} finished before shared session opened; releasing late acquire`);
           this.shared.release();
           return;
         }
         acquired = true;
+        this.log.info(`Snapshot refresh for ${this.cameraConfig.name} acquired shared camera session`);
         feedCachedKeyframe();
       }).catch((error) => finish(error as Error));
     }
@@ -569,6 +638,8 @@ export class StreamingDelegate implements CameraStreamingDelegate {
     let cleaned = false;
     let callbackCompleted = false;
     let acquired = false;
+    let acquiring = false;
+    let pendingAcquireReleased = false;
     let ffmpeg: ChildProcess | undefined;
     let returnFfmpeg: ChildProcess | undefined;
     let returnSocket: Socket | undefined;
@@ -612,6 +683,7 @@ export class StreamingDelegate implements CameraStreamingDelegate {
       if (cleaned) return;
       const wasStarted = started;
       cleaned = true;
+      this.log.info(`Cleaning up HomeKit stream for ${this.cameraConfig.name} (${reason}, started=${wasStarted})`);
       if (startupTimeout) clearTimeout(startupTimeout);
       if (inactivityTimer) clearTimeout(inactivityTimer);
       this.shared.removeListener('video', onVideo);
@@ -622,6 +694,14 @@ export class StreamingDelegate implements CameraStreamingDelegate {
       returnFfmpeg?.kill('SIGKILL');
       this.active.delete(request.sessionID);
       this.pending.delete(request.sessionID);
+      if (acquiring && !acquired && !pendingAcquireReleased) {
+        pendingAcquireReleased = true;
+        this.log.info(
+          `HomeKit stream for ${this.cameraConfig.name} stopped while waiting for shared session; `
+          + `canceling pending acquire (${reason})`,
+        );
+        this.shared.release();
+      }
       if (wasStarted && reason !== 'shutdown' && this.shared.open) {
         // HomeKit often shows the just-ended live frame for a moment, then asks
         // us for a tile snapshot. Capture a fresh still immediately while the
@@ -646,23 +726,27 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         this.log.warn(`HomeKit stream failed for ${this.cameraConfig.name}: ${error.message}`);
         finishCallback(error);
         cleanup('startup-timeout');
-      }, 45_000);
+      }, this.streamStartupTimeoutMs);
       this.log.info(
         `Starting HomeKit stream for ${this.cameraConfig.name} `
-        + `(${request.video.width}x${request.video.height}@${request.video.fps}fps)`,
+        + `(${request.video.width}x${request.video.height}@${request.video.fps}fps, `
+        + `startupTimeout=${secondsLabel(this.streamStartupTimeoutMs)})`,
       );
 
+      acquiring = true;
+      this.log.info(`HomeKit stream for ${this.cameraConfig.name} waiting for shared camera session`);
       await this.shared.acquire();
-      acquired = true;
+      acquiring = false;
       if (cleaned) {
         // cleanup() ran while acquire() was still pending (HomeKit STOP or the
-        // startup timeout), so it couldn't release the slot it didn't yet hold.
-        // Release it now that the acquire has resolved, or the shared session
-        // leaks a consumer and never idles out.
-        acquired = false;
-        this.shared.release();
+        // startup timeout). It normally released/canceled the pending consumer
+        // already, but older paths may not have; be defensive.
+        if (!pendingAcquireReleased) this.shared.release();
+        this.log.info(`HomeKit stream for ${this.cameraConfig.name} acquired after cleanup; not starting FFmpeg`);
         return;
       }
+      acquired = true;
+      this.log.info(`HomeKit stream for ${this.cameraConfig.name} acquired shared camera session`);
 
       const hasHomeKitAudio = Boolean((request as { audio?: StartStreamRequest['audio'] }).audio);
       const hasAudio = this.shared.hasAudio && hasHomeKitAudio
@@ -758,9 +842,11 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         this.startStream(request, callback);
         break;
       case this.hap.StreamRequestTypes.RECONFIGURE:
+        this.log.info(`HomeKit stream reconfigure received for ${this.cameraConfig.name}`);
         callback();
         break;
       case this.hap.StreamRequestTypes.STOP:
+        this.log.info(`HomeKit stream stop received for ${this.cameraConfig.name}`);
         this.active.get(request.sessionID)?.cleanup('homekit-stop');
         callback();
         break;

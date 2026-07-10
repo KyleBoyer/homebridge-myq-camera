@@ -11,10 +11,22 @@ export interface CameraSessionOptions {
   quality?: number;
   fps?: number;
   size?: number;
+  videoPunchTimeoutMs?: number;
+  videoPunchAttempts?: number;
+  videoPunchRetryDelayMs?: number;
+  releaseCooldownMs?: number;
 }
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function seconds(ms: number): string {
+  return `${(ms / 1000).toFixed(ms % 1000 === 0 ? 0 : 1)}s`;
 }
 
 export class TendConnectionManager {
@@ -43,7 +55,10 @@ export class TendConnectionManager {
   async awaitReleaseCooldown(minGapMs = 3_000): Promise<void> {
     if (!this.lastReleaseAt) return;
     const remaining = minGapMs - (Date.now() - this.lastReleaseAt);
-    if (remaining > 0) await delay(remaining);
+    if (remaining > 0) {
+      this.log.info(`Waiting ${seconds(remaining)} for myQ camera to release prior media session`);
+      await delay(remaining);
+    }
   }
 
   async connect(): Promise<TendClient> {
@@ -101,6 +116,7 @@ export class TendConnectionManager {
  */
 export class SharedCameraSession extends EventEmitter {
   private session?: MyqCameraSession;
+  private opening?: MyqCameraSession;
   private pending?: Promise<MyqCameraSession>;
   private consumers = 0;
   private idleTimer?: NodeJS.Timeout;
@@ -157,6 +173,7 @@ export class SharedCameraSession extends EventEmitter {
     if (this.pending) {
       try {
         await this.pending;
+        if (this.session && this.consumers === 0 && !this.idleTimer) this.scheduleIdleClose();
       } catch (error) {
         this.consumers = Math.max(0, this.consumers - 1);
         throw error;
@@ -166,6 +183,7 @@ export class SharedCameraSession extends EventEmitter {
     this.pending = this.openInternal();
     try {
       await this.pending;
+      if (this.session && this.consumers === 0 && !this.idleTimer) this.scheduleIdleClose();
     } catch (error) {
       this.consumers = Math.max(0, this.consumers - 1);
       throw error;
@@ -176,6 +194,7 @@ export class SharedCameraSession extends EventEmitter {
 
   private async openInternal(): Promise<MyqCameraSession> {
     const session = this.factory();
+    this.opening = session;
     let openError: Error | undefined;
     // Capture errors emitted before the session is adopted with a local handler,
     // so they can't run this.onError() — which would teardown() and reset the
@@ -186,6 +205,7 @@ export class SharedCameraSession extends EventEmitter {
     session.on('audio', this.onAudio);
     session.on('error', onOpenError);
     const abandon = (): void => {
+      if (this.opening === session) this.opening = undefined;
       session.removeListener('video', this.onVideo);
       session.removeListener('audio', this.onAudio);
       session.removeListener('error', onOpenError);
@@ -208,6 +228,7 @@ export class SharedCameraSession extends EventEmitter {
     // no error can slip through in between).
     session.on('error', this.onError);
     session.removeListener('error', onOpenError);
+    if (this.opening === session) this.opening = undefined;
     this.session = session;
     return session;
   }
@@ -240,9 +261,18 @@ export class SharedCameraSession extends EventEmitter {
   /** Release a consumer; when the last one leaves, keep the session warm. */
   release(): void {
     this.consumers = Math.max(0, this.consumers - 1);
-    if (this.consumers === 0 && this.session && !this.idleTimer) {
-      this.idleTimer = setTimeout(() => { void this.idleClose(); }, this.keepAliveMs);
+    if (this.consumers === 0) {
+      if (this.session && !this.idleTimer) {
+        this.scheduleIdleClose();
+      } else if (!this.session && this.pending && this.opening) {
+        this.log.info('No HomeKit consumers remain while myQ session is opening; canceling pending camera open');
+        this.opening.close();
+      }
     }
+  }
+
+  private scheduleIdleClose(): void {
+    this.idleTimer = setTimeout(() => { void this.idleClose(); }, this.keepAliveMs);
   }
 
   private async idleClose(): Promise<void> {
@@ -273,7 +303,9 @@ export class SharedCameraSession extends EventEmitter {
       this.idleTimer = undefined;
     }
     const session = this.session;
+    const opening = this.opening;
     this.session = undefined;
+    this.opening = undefined;
     this.consumers = 0;
     this.sps = undefined;
     this.pps = undefined;
@@ -283,6 +315,11 @@ export class SharedCameraSession extends EventEmitter {
       session.removeListener('audio', this.onAudio);
       session.removeListener('error', this.onError);
       session.close();
+    }
+    if (opening && opening !== session) {
+      opening.removeListener('video', this.onVideo);
+      opening.removeListener('audio', this.onAudio);
+      opening.close();
     }
   }
 
@@ -329,7 +366,7 @@ export class MyqCameraSession extends EventEmitter {
    * attempt requests fresh connection info because the relay assignment may
    * change between tries.
    */
-  private async establishVideo(attempts = 2): Promise<void> {
+  private async establishVideo(): Promise<void> {
     // Capture stable references: close() nulls this.client/this.camera, and the
     // retry loop below awaits, so HomeKit tearing the session down mid-setup
     // must not turn into an undefined dereference. We bail via the `closed`
@@ -338,6 +375,9 @@ export class MyqCameraSession extends EventEmitter {
     const camera = this.camera;
     if (!client || !camera) throw new Error('camera session was torn down before video setup');
     const noop = (): void => {};
+    const attempts = Math.max(1, Math.trunc(this.options.videoPunchAttempts ?? 2));
+    const timeoutMs = Math.max(1_000, this.options.videoPunchTimeoutMs ?? 8_000);
+    const retryDelayMs = Math.max(0, this.options.videoPunchRetryDelayMs ?? 4_000);
     let last: unknown;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       if (this.closed) throw new Error('camera session closed during video setup');
@@ -345,20 +385,42 @@ export class MyqCameraSession extends EventEmitter {
       const session = new P2PMediaSession(camera, info, 'V', 'w1', 90_000);
       session.on('error', noop); // absorb transient socket errors during the punch
       try {
-        await session.punch(8_000);
+        this.log.info(
+          `myQ video hole punch starting (attempt ${attempt + 1}/${attempts}, `
+          + `timeout=${seconds(timeoutMs)})`,
+        );
+        await session.punch(timeoutMs);
       } catch (error) {
         last = error;
         session.close();
-        if (this.closed || attempt + 1 >= attempts) throw last;
+        if (this.closed) {
+          this.log.info(
+            `myQ video hole punch canceled while opening camera session `
+            + `(attempt ${attempt + 1}/${attempts}): ${describeError(error)}`,
+          );
+          throw new Error('camera session closed during video setup');
+        }
+        if (attempt + 1 >= attempts) {
+          this.log.warn(
+            `myQ video hole punch failed (attempt ${attempt + 1}/${attempts}); `
+            + `no retries left: ${describeError(error)}`,
+          );
+          throw last;
+        }
         this.log.warn(
-          `myQ video hole punch failed (attempt ${attempt + 1}/${attempts}); the camera `
-          + 'may still be releasing a prior session — retrying after a cooldown',
+          `myQ video hole punch failed (attempt ${attempt + 1}/${attempts}): `
+          + `${describeError(error)}; retrying after ${seconds(retryDelayMs)}`,
         );
-        await delay(4_000);
+        await delay(retryDelayMs);
+        if (this.closed) {
+          this.log.info('myQ video hole punch retry canceled while waiting for retry cooldown');
+          throw new Error('camera session closed during video setup');
+        }
         continue;
       }
       if (this.closed) {
         session.close();
+        this.log.info('myQ video hole punch succeeded, but camera session was canceled before adoption');
         throw new Error('camera session closed during video setup');
       }
       session.removeListener('error', noop);
@@ -376,6 +438,7 @@ export class MyqCameraSession extends EventEmitter {
         this.options.fps ?? 20,
         this.options.size ?? 0,
       );
+      this.log.info(`myQ video hole punch succeeded (attempt ${attempt + 1}/${attempts})`);
       return;
     }
     throw last;
@@ -395,7 +458,7 @@ export class MyqCameraSession extends EventEmitter {
         : 'no Tend TC-series cameras found on this account');
     }
 
-    await this.connection.awaitReleaseCooldown();
+    await this.connection.awaitReleaseCooldown(this.options.releaseCooldownMs ?? 3_000);
     await this.establishVideo();
 
     if (this.options.audio !== false) {
