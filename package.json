@@ -34,6 +34,8 @@
     "dist/**/*",
     "!dist/test/**/*",
     "config.schema.json",
+    "docs/**/*",
+    "tools/capture_myq_token.py",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
