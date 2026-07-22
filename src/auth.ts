@@ -3,9 +3,15 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 const TOKEN_URL = 'https://partner-identity.myq-cloud.com/connect/token';
-const CLIENT_ID = 'ANDROID_CGI_MYQ';
 const SCOPE = 'MyQ_Residential offline_access';
-const REDIRECT_URI = 'com.myqops://android';
+
+const OAUTH_CLIENTS = {
+  ANDROID_CGI_MYQ: { redirectUri: 'com.myqops://android' },
+  IOS_CGI_MYQ: { redirectUri: undefined },
+} as const;
+
+export type MyqOAuthClient = keyof typeof OAUTH_CLIENTS;
+export type TokenFetcher = (url: string, init: RequestInit) => Promise<Response>;
 
 export interface MyqToken {
   access_token: string;
@@ -13,6 +19,7 @@ export interface MyqToken {
   expires_in?: number;
   token_type?: string;
   scope?: string;
+  client_id?: MyqOAuthClient;
 }
 
 export function expandHome(path: string): string {
@@ -39,18 +46,40 @@ async function saveToken(path: string, token: MyqToken): Promise<void> {
   await rename(temporary, destination);
 }
 
-async function refreshToken(refreshToken: string): Promise<MyqToken> {
+function oauthClient(value: unknown): MyqOAuthClient {
+  const clientId = value ?? 'ANDROID_CGI_MYQ';
+  if (typeof clientId !== 'string' || !(clientId in OAUTH_CLIENTS)) {
+    throw new Error(`token file contains unsupported client_id: ${String(clientId)}`);
+  }
+  return clientId as MyqOAuthClient;
+}
+
+export function buildRefreshTokenBody(
+  refreshToken: string,
+  clientId: MyqOAuthClient,
+): URLSearchParams {
   const body = new URLSearchParams({
-    client_id: CLIENT_ID,
+    client_id: clientId,
     scope: SCOPE,
-    redirect_uri: REDIRECT_URI,
     grant_type: 'refresh_token',
     refresh_token: refreshToken,
   });
-  const response = await fetch(TOKEN_URL, {
+  const redirectUri = OAUTH_CLIENTS[clientId].redirectUri;
+  if (redirectUri) {
+    body.set('redirect_uri', redirectUri);
+  }
+  return body;
+}
+
+async function refreshToken(
+  refreshToken: string,
+  clientId: MyqOAuthClient,
+  fetcher: TokenFetcher,
+): Promise<MyqToken> {
+  const response = await fetcher(TOKEN_URL, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body,
+    body: buildRefreshTokenBody(refreshToken, clientId),
     signal: AbortSignal.timeout(20_000),
   });
   const payload = await response.json() as Record<string, unknown>;
@@ -66,6 +95,7 @@ async function refreshToken(refreshToken: string): Promise<MyqToken> {
     expires_in: typeof payload.expires_in === 'number' ? payload.expires_in : undefined,
     token_type: typeof payload.token_type === 'string' ? payload.token_type : 'Bearer',
     scope: typeof payload.scope === 'string' ? payload.scope : undefined,
+    client_id: clientId,
   };
 }
 
@@ -73,7 +103,10 @@ export class TokenManager {
   private cached?: { token: MyqToken; expiresAt: number };
   private pending?: Promise<string>;
 
-  constructor(readonly tokenFile: string) {}
+  constructor(
+    readonly tokenFile: string,
+    private readonly fetcher: TokenFetcher = (url, init) => fetch(url, init),
+  ) {}
 
   async accessToken(): Promise<string> {
     if (this.cached && this.cached.expiresAt - Date.now() > 60_000) {
@@ -92,7 +125,10 @@ export class TokenManager {
 
   private async refresh(): Promise<string> {
     const stored = await loadToken(this.tokenFile);
-    const token = stored.refresh_token ? await refreshToken(stored.refresh_token) : stored;
+    const clientId = oauthClient(stored.client_id);
+    const token = stored.refresh_token
+      ? await refreshToken(stored.refresh_token, clientId, this.fetcher)
+      : stored;
     if (stored.refresh_token) {
       await saveToken(this.tokenFile, token);
     }

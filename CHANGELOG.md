@@ -5,6 +5,18 @@ All notable changes to `homebridge-myq-camera` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Support refresh tokens issued by the iOS myQ app when the token file records
+  `"client_id": "IOS_CGI_MYQ"`.
+- An iPhone token bootstrap guide and narrow mitmproxy capture
+  helper.
+
+### Changed
+- Preserve the existing Android refresh behavior for legacy token files while
+  retaining OAuth client provenance across token rotation.
+
 ## [0.3.3] - 2026-07-10
 
 ### Added

@@ -62,10 +62,28 @@ valid refresh token:
 ```
 
 `access_token` may be left empty — the plugin exchanges the refresh token on first use and
-stores the rotated result. To obtain the refresh token, extract it once from a logged-in
-myQ app session on a rooted Android device — e.g. hook `javax.crypto.Cipher.doFinal` with
-Frida and capture the 64-hex refresh token the app decrypts at launch. Guard this file —
-it is a live account credential.
+stores the rotated result.
+
+### Android
+
+To obtain the refresh token, extract it once from a logged-in myQ app session on a rooted
+Android device — e.g. hook `javax.crypto.Cipher.doFinal` with Frida and capture the 64-hex
+refresh token the app decrypts at launch. Existing token files without a `client_id` keep
+using the Android OAuth client for backward compatibility.
+
+### iPhone
+
+An iPhone can provide the same one-time credential through a short,
+explicit mitmproxy session on a trusted private LAN using a macOS or Linux proxy host.
+Follow the [iPhone token bootstrap guide](docs/iphone-token-bootstrap.md). The capture
+helper records the iOS OAuth client beside the token:
+
+```json
+{"access_token": "", "refresh_token": "PASTE_YOUR_REFRESH_TOKEN", "client_id": "IOS_CGI_MYQ"}
+```
+
+The proxy and its temporary certificate are not needed after bootstrap. Remove both from
+the phone immediately after the token has been captured.
 
 Place the token where the Homebridge service account can read and update it. By
 default the plugin uses:
