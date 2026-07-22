@@ -48,7 +48,10 @@ async function saveToken(path: string, token: MyqToken): Promise<void> {
 
 function oauthClient(value: unknown): MyqOAuthClient {
   const clientId = value ?? 'ANDROID_CGI_MYQ';
-  if (typeof clientId !== 'string' || !(clientId in OAUTH_CLIENTS)) {
+  if (
+    typeof clientId !== 'string'
+    || !Object.prototype.hasOwnProperty.call(OAUTH_CLIENTS, clientId)
+  ) {
     throw new Error(`token file contains unsupported client_id: ${String(clientId)}`);
   }
   return clientId as MyqOAuthClient;

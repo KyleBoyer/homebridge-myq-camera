@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-21
+
 ### Added
 - Support refresh tokens issued by the iOS myQ app when the token file records
   `"client_id": "IOS_CGI_MYQ"`.
@@ -16,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Preserve the existing Android refresh behavior for legacy token files while
   retaining OAuth client provenance across token rotation.
+
+### Fixed
+- Harden OAuth `client_id` validation so inherited object property names are
+  never treated as supported clients.
 
 ## [0.3.3] - 2026-07-10
 

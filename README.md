@@ -1,5 +1,7 @@
 # homebridge-myq-camera
 
+[![verified-by-homebridge](https://img.shields.io/badge/homebridge-verified-blueviolet?color=%23491F59&style=for-the-badge&logoColor=%23FFFFFF&logo=homebridge)](https://github.com/homebridge/homebridge/wiki/Verified-Plugins)
+
 Native Homebridge camera support for legacy myQ **TC-series** cameras built on the
 Tend/Seedonk stack. It runs entirely in Node.js/TypeScript: no phone, Android emulator,
 Python runtime, go2rtc, or separate media server is required.

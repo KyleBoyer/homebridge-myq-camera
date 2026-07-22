@@ -105,3 +105,22 @@ test('unsupported OAuth clients fail before any network request', async (t) => {
     /unsupported client_id: UNKNOWN_CLIENT/,
   );
 });
+
+test('inherited object properties are not accepted as OAuth clients', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'homebridge-myq-auth-'));
+  const tokenFile = join(directory, 'token.json');
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await writeFile(tokenFile, JSON.stringify({
+    access_token: '',
+    refresh_token: 'refresh',
+    client_id: 'toString',
+  }));
+  const fetcher: TokenFetcher = async () => {
+    throw new Error('network request should not occur');
+  };
+
+  await assert.rejects(
+    new TokenManager(tokenFile, fetcher).accessToken(),
+    /unsupported client_id: toString/,
+  );
+});
